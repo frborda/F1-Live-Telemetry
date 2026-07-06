@@ -35,6 +35,7 @@ class _AuthWorker(QObject):
 
     def _run(self) -> None:
         try:
+            import socket
             from http.server import HTTPServer
 
             from fastf1.internals import f1auth
@@ -44,6 +45,19 @@ class _AuthWorker(QObject):
             port = httpd.server_port
             server = threading.Thread(target=httpd.serve_forever, daemon=True)
             server.start()
+            # The browser extension posts to "localhost", which resolves to
+            # ::1 first on Windows — listen there too, on the same port.
+            httpd6 = None
+            try:
+                class _V6Server(HTTPServer):
+                    address_family = socket.AF_INET6
+
+                httpd6 = _V6Server(("::1", port), f1auth.AuthHandler)
+                threading.Thread(
+                    target=httpd6.serve_forever, daemon=True
+                ).start()
+            except OSError:
+                pass
             url = f"https://f1login.fastf1.dev?port={port}"
             self.progress.emit(
                 f"Waiting for browser sign-in (up to {self.TIMEOUT_S // 60}"
@@ -53,6 +67,8 @@ class _AuthWorker(QObject):
             webbrowser.open(url)
             ok = f1auth._auth_finished.wait(timeout=self.TIMEOUT_S)
             httpd.shutdown()
+            if httpd6 is not None:
+                httpd6.shutdown()
             token = f1auth._subscription_token if ok else None
             if token:
                 f1auth.AUTH_DATA_FILE.write_text(token)
