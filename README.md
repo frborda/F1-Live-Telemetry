@@ -118,11 +118,6 @@ follows the most recent capture file.
 - **Smooth rendering**: 30 fps refresh; sliding windows and each series' tip
   interpolate between telemetry batches (never predicting ahead of real
   data), so lines draw continuously and precisely.
-- **PostgreSQL (optional)**: with **Record** enabled, every sample is
-  inserted into a local `telemetry` table (created automatically). If the
-  database is unavailable, the app keeps working and reports it in the
-  status bar.
-
 ## Usage (development)
 
 ```powershell

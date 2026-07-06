@@ -9,7 +9,6 @@ def _selftest() -> int:
     (útil para validar el build congelado): F1Telem.exe --selftest"""
     try:
         import fastf1  # noqa: F401
-        import psycopg  # noqa: F401
         import pyqtgraph  # noqa: F401
         import requests  # noqa: F401
         import signalrcore  # noqa: F401
@@ -18,7 +17,6 @@ def _selftest() -> int:
         from .sources import (  # noqa: F401
             CaptureSource, DemoSource, LiveSource, ReplaySource,
         )
-        from .storage import PgWriter  # noqa: F401
         return 0
     except Exception:
         import traceback

@@ -4,8 +4,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap, QPolygonF, QIcon
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QCheckBox, QComboBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QPushButton, QSlider, QSpinBox, QSplitter, QStackedWidget,
     QVBoxLayout, QWidget,
 )
@@ -14,7 +14,6 @@ from .. import config
 from ..hub import DataHub
 from ..models import CHANNELS, CHANNEL_ORDER
 from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplaySource
-from ..storage import PgWriter
 from . import theme
 from .charts import RollingChart, WrapChart
 from .qualy_view import QualyView
@@ -169,37 +168,6 @@ class LapRuler(QWidget):
         self._seek(t)
 
 
-class PgDialog(QDialog):
-    def __init__(self, pg_cfg: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("PostgreSQL")
-        form = QFormLayout(self)
-        self.host = QLineEdit(pg_cfg.get("host", "localhost"))
-        self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(int(pg_cfg.get("port", 5432)))
-        self.dbname = QLineEdit(pg_cfg.get("dbname", "f1telem"))
-        self.user = QLineEdit(pg_cfg.get("user", "postgres"))
-        self.password = QLineEdit(pg_cfg.get("password", ""))
-        self.password.setEchoMode(QLineEdit.Password)
-        form.addRow("Host", self.host)
-        form.addRow("Port", self.port)
-        form.addRow("Database", self.dbname)
-        form.addRow("User", self.user)
-        form.addRow("Password", self.password)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
-
-    def values(self) -> dict:
-        return {
-            "host": self.host.text().strip(),
-            "port": self.port.value(),
-            "dbname": self.dbname.text().strip(),
-            "user": self.user.text().strip(),
-            "password": self.password.text(),
-        }
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -208,11 +176,9 @@ class MainWindow(QMainWindow):
 
         self.cfg = config.load_config()
         self.hub = DataHub(self)
-        self.pg_writer = PgWriter(self.cfg["pg"], self)
         self.source: BaseSource | None = None
         self._progress: tuple[float, float, float] | None = None
         self._source_status = "Not connected."
-        self._pg_status = ""
 
         self.chart_rolling = RollingChart(self.hub)
         self.chart_wrap = WrapChart(self.hub)
@@ -277,6 +243,7 @@ class MainWindow(QMainWindow):
         form.addRow("GP", self.gp_combo)
         form.addRow("Session", self.session_combo)
         form.addRow("Speed", self.speed_combo)
+        self._replay_form = form
         src_lay.addLayout(form)
 
         self.connect_btn = QPushButton("Connect")
@@ -337,16 +304,6 @@ class MainWindow(QMainWindow):
         ref_lay.addRow(ref_btns)
         self.ref_box.setVisible(False)
         side.addWidget(self.ref_box)
-
-        # --- postgres ---
-        pg_box = QGroupBox("PostgreSQL")
-        pg_lay = QHBoxLayout(pg_box)
-        self.pg_check = QCheckBox("Record")
-        self.pg_check.setChecked(bool(self.cfg["pg"].get("enabled")))
-        self.pg_btn = QPushButton("Configure...")
-        pg_lay.addWidget(self.pg_check)
-        pg_lay.addWidget(self.pg_btn)
-        side.addWidget(pg_box)
 
         side_widget = QWidget()
         side_widget.setLayout(side)
@@ -429,9 +386,6 @@ class MainWindow(QMainWindow):
                       self.chart_qualy.chart, self.chart_timing):
             chart.hover_dist_cb = self._on_chart_hover
         self.track_map.hover_dist_cb = self._on_map_hover
-        self.pg_btn.clicked.connect(self._configure_pg)
-        self.pg_check.toggled.connect(self._pg_toggled)
-        self.pg_writer.statusChanged.connect(self._on_pg_status)
         self.map_check.toggled.connect(self._map_toggled)
         self.trails_check.toggled.connect(self._trails_toggled)
         self.track_map.set_trails_enabled(self.trails_check.isChecked())
@@ -452,6 +406,14 @@ class MainWindow(QMainWindow):
         self._sync_window_combo()
         self.year_spin.valueChanged.connect(self._load_schedule)
         self._load_schedule()
+        self.source_combo.currentIndexChanged.connect(self._source_kind_changed)
+        self._source_kind_changed(self.source_combo.currentIndex())
+
+    def _source_kind_changed(self, kind: int) -> None:
+        """Year/GP/Session solo aplican a Replay; Speed no aplica a Live."""
+        for row in (0, 1, 2):
+            self._replay_form.setRowVisible(row, kind == 1)
+        self._replay_form.setRowVisible(3, kind != 2)
 
     # ------------------------------------------------------------- conexión
 
@@ -530,8 +492,6 @@ class MainWindow(QMainWindow):
         self.source = source
         self.connect_btn.setText("Disconnect")
         self.source_combo.setEnabled(False)
-        if self.pg_check.isChecked():
-            self.pg_writer.start(source.session_key)
         source.start()
 
     def _disconnect(self) -> None:
@@ -541,7 +501,6 @@ class MainWindow(QMainWindow):
         source.stop()
         source.wait(8000)
         source.deleteLater()
-        self.pg_writer.stop()
         self.connect_btn.setText("Connect")
         self.source_combo.setEnabled(True)
         self.seek_row.setVisible(False)
@@ -553,7 +512,6 @@ class MainWindow(QMainWindow):
             # la fuente terminó sola (error fatal en la carga, etc.)
             source, self.source = self.source, None
             source.deleteLater()
-            self.pg_writer.stop()
             self.connect_btn.setText("Connect")
             self.source_combo.setEnabled(True)
             self.seek_row.setVisible(False)
@@ -646,7 +604,6 @@ class MainWindow(QMainWindow):
 
     def _on_batch(self, samples: list) -> None:
         self.hub.on_batch(samples)
-        self.pg_writer.enqueue(samples)
 
     def _on_source_status(self, text: str) -> None:
         self._source_status = text
@@ -839,26 +796,6 @@ class MainWindow(QMainWindow):
             return
         self.chart_qualy.set_reference(drv, int(lap))
 
-    # ------------------------------------------------------------- postgres
-
-    def _configure_pg(self) -> None:
-        dlg = PgDialog(self.cfg["pg"], self)
-        if dlg.exec() == QDialog.Accepted:
-            self.cfg["pg"].update(dlg.values())
-            config.save_config(self.cfg)
-
-    def _pg_toggled(self, on: bool) -> None:
-        self.cfg["pg"]["enabled"] = on
-        config.save_config(self.cfg)
-        if on and self.source is not None:
-            self.pg_writer.start(self.source.session_key)
-        elif not on:
-            self.pg_writer.stop()
-
-    def _on_pg_status(self, text: str) -> None:
-        self._pg_status = text
-        self.status_label.setText(f"{self._source_status}  |  {text}")
-
     def _map_toggled(self, on: bool) -> None:
         self.track_map.setVisible(on)
         self.cfg.setdefault("ui", {})["show_map"] = on
@@ -912,8 +849,6 @@ class MainWindow(QMainWindow):
             _t, air, track, wind, rain = weather
             meta = (f"Air {air:.0f}°  ·  Track {track:.0f}°  ·  Wind {wind:.1f} m/s"
                     + ("  ·  RAIN" if rain else "") + "  |  " + meta)
-        if self.pg_writer.active:
-            meta += f"  ·  PG: {self.pg_writer.rows_written:,} rows"
         self.meta_label.setText(meta)
 
     def closeEvent(self, event) -> None:

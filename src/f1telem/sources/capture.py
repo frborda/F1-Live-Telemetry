@@ -39,10 +39,6 @@ class CaptureSource(LiveDecoderMixin, BaseSource):
         self._marks_dirty = False
         self._max_lap_seen = 0
 
-    @property
-    def session_key(self) -> str:
-        return f"capture-{os.path.basename(self.path)}"
-
     def request_seek(self, t: float) -> None:
         self._seek_t = float(t)
 

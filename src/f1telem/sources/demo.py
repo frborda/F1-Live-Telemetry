@@ -95,10 +95,6 @@ class DemoSource(BaseSource):
     def set_paused(self, paused: bool) -> None:
         self._paused = bool(paused)
 
-    @property
-    def session_key(self) -> str:
-        return "demo"
-
     def run(self) -> None:
         rng = random.Random(42)
         cars = [_Car(info, rng) for info in _DRIVERS]

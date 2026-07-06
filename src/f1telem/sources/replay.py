@@ -45,10 +45,6 @@ class ReplaySource(BaseSource):
     def set_paused(self, paused: bool) -> None:
         self._paused = bool(paused)
 
-    @property
-    def session_key(self) -> str:
-        return f"replay-{self.year}-{self.gp}-{self.session_name}"
-
     def run(self) -> None:
         try:
             stream = self._load()

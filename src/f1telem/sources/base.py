@@ -39,8 +39,3 @@ class BaseSource(QThread):
 
     def stop(self) -> None:
         self._running = False
-
-    @property
-    def session_key(self) -> str:
-        """Identificador de la sesión para almacenamiento (Postgres)."""
-        return "unknown"

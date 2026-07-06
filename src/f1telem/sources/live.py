@@ -263,10 +263,6 @@ class LiveSource(LiveDecoderMixin, BaseSource):
         self._connected = False
         self._conn = None
 
-    @property
-    def session_key(self) -> str:
-        return f"live-{dt.date.today().isoformat()}"
-
     @staticmethod
     def stored_token() -> str | None:
         """Token de suscripción F1TV guardado por FastF1 (si existe)."""

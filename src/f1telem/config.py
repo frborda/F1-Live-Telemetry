@@ -30,14 +30,6 @@ def recordings_dir() -> Path:
 
 
 DEFAULTS = {
-    "pg": {
-        "enabled": False,
-        "host": "localhost",
-        "port": 5432,
-        "dbname": "f1telem",
-        "user": "postgres",
-        "password": "",
-    },
     "replay": {"year": 2025, "gp": "Bahrain", "session": "R", "speed": 5.0},
     "ui": {
         "gap_window_laps": 0.0,      # ventana X del gráfico de gap en vueltas (0 = todo)
