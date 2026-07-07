@@ -62,6 +62,8 @@ It shows the output file, connection status and data counters, and offers
 the main app and pick the *Capture (recorded live)* source: it automatically
 follows the most recent capture file.
 
+![Capturer recording the live stream during a race, authenticated with F1TV](docs/capture.png)
+
 ## Features
 
 - **Pause and hot speed change** (demo/replay): the ⏸ button next to the
