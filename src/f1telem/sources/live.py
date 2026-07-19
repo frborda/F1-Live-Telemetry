@@ -78,6 +78,28 @@ def _parse_time_value(text) -> float:
         return 0.0
 
 
+def _circuit_rows(info: dict):
+    """Trazado y curvas del JSON de la API de circuitos de MultiViewer
+    (mismo sistema de coordenadas que Position.z; length en decímetros)."""
+    xs = info.get("x") or []
+    ys = info.get("y") or []
+    outline = (xs, ys) if len(xs) > 10 and len(xs) == len(ys) else None
+    rows = []
+    for c in info.get("corners") or []:
+        num = c.get("number")
+        pos = c.get("trackPosition") or {}
+        dist = c.get("length")
+        if num is None or dist is None:
+            continue
+        rows.append((
+            f"T{int(num)}{c.get('letter') or ''}",
+            float(dist) / 10.0,
+            float(pos.get("x", 0.0)),
+            float(pos.get("y", 0.0)),
+        ))
+    return outline, rows
+
+
 class _CarState:
     __slots__ = ("last_t", "last_speed", "dist_total", "lap", "lap_start_dist")
 
@@ -110,6 +132,9 @@ class LiveDecoderMixin:
         # el snapshot inicial trae valores de la vuelta ANTERIOR: no sirven
         # para atribuir tiempos a la vuelta en curso (los Segments sí)
         self._in_snapshot = False
+        # persiste entre seeks de la captura: el trazado ya emitido se
+        # conserva en el hub, no hace falta re-pedirlo a la API
+        self._circuit_fetched = getattr(self, "_circuit_fetched", False)
 
     # ------------------------------------------------------------- protocolo
 
@@ -191,6 +216,35 @@ class LiveDecoderMixin:
         name = data.get("Name", "")
         if meeting or name:
             self.statusChanged.emit(f"Live: {meeting} — {name}")
+        # trazado completo inmediato: la API de circuitos de MultiViewer usa
+        # las mismas coordenadas que Position.z. Sin esto, el mapa se
+        # autoconstruía recién cuando un auto cerraba ~2 vueltas (minutos), y
+        # quedaba incompleto o deformado si ese auto pasaba por boxes.
+        circuit_key = ((data.get("Meeting") or {}).get("Circuit") or {}).get("Key")
+        year = str(data.get("StartDate", ""))[:4]
+        if circuit_key and year.isdigit() and not self._circuit_fetched:
+            self._circuit_fetched = True
+            threading.Thread(
+                target=self._fetch_circuit, args=(circuit_key, year),
+                daemon=True, name="circuit-fetch",
+            ).start()
+
+    def _fetch_circuit(self, key, year) -> None:
+        try:
+            import requests
+
+            resp = requests.get(
+                f"https://api.multiviewer.app/api/v1/circuits/{key}/{year}",
+                timeout=20, headers={"User-Agent": "F1LiveTelemetry"},
+            )
+            resp.raise_for_status()
+            outline, corners = _circuit_rows(resp.json())
+            if outline is not None:
+                self.trackOutline.emit(outline)
+            if corners:
+                self.corners.emit(corners)
+        except Exception:
+            pass  # sin red, el mapa se autoconstruye siguiendo a un auto
 
     def _on_driver_list(self, data) -> None:
         if not isinstance(data, dict):

@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "F1 Live Telemetry Companion",
+  "version": "1.0.0",
+  "description": "Signs in with your Formula 1 account and hands the F1TV token to the local F1 Live Telemetry / FastF1 app.",
+  "icons": {
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "permissions": ["cookies", "storage"],
+  "host_permissions": [
+    "*://localhost/*",
+    "http://127.0.0.1/*",
+    "*://*.formula1.com/*",
+    "*://*.fastf1.dev/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

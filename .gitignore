@@ -1,5 +1,7 @@
 .venv/
 build/
 dist/
+dist-live/
+dist-rel/
 __pycache__/
 *.pyc

@@ -62,6 +62,61 @@ It shows the output file, connection status and data counters, and offers
 the main app and pick the *Capture (recorded live)* source: it automatically
 follows the most recent capture file.
 
+### F1TV sign-in: setup and login procedure
+
+**What you need**
+
+- An active **F1TV Access/Pro/Premium subscription** (the live stream needs
+  it; without a token the app still connects but data may be partial).
+- A Chromium browser (Chrome/Edge/Brave) **on the same machine as the
+  capturer** — the login hands the token to the app through `localhost`.
+- The **companion extension** installed once (next section). The official
+  *FastF1 Companion* extension is outdated — Chrome 130+ blocks its request
+  to `localhost` (Local Network Access), which shows up as *"Could not
+  connect to the local FastF1 application"* — so this repo ships its own
+  drop-in replacement.
+
+**Install the extension (once)**
+
+1. Locate the `extension` folder: next to `F1LiveTelemetry.exe` in the
+   release, or at the repo root.
+2. Open `chrome://extensions` in Chrome, enable **Developer mode**
+   (top-right toggle) and click **Load unpacked**.
+3. Pick the `extension` folder — "F1 Live Telemetry Companion" appears in
+   the list. Keep the folder where it is (Chrome loads it from there).
+4. If you have the old *FastF1 Companion*, **disable it** in
+   `chrome://extensions` — both react to the same sign-in URL and would
+   race each other.
+5. If the app's sign-in opens a different browser, either make Chrome your
+   default browser or copy the sign-in URL shown in the capturer's status
+   line into Chrome manually.
+
+**Login procedure**
+
+1. In the capturer press **Sign in with F1TV…** — the app starts a local
+   listener and opens the sign-in URL in your browser (up to 15 minutes;
+   keep the capturer open).
+2. The extension takes you to the **Formula 1 account login** — sign in
+   with your F1TV credentials (2FA included if you use it).
+3. When the login lands on *my account*, the extension opens its **Connect**
+   page and delivers the token to the app automatically — it declares
+   `targetAddressSpace: "loopback"` (the Chrome 130+ requirement) and the
+   app's local server answers with `Access-Control-Allow-Private-Network:
+   true`, the two halves of the Local Network Access handshake.
+4. The capturer's **F1TV** line switches to *"token found (authenticated)"*.
+   Done — the token is stored in Fast-F1's `f1auth.json`, shared with
+   anything else that uses Fast-F1, and reused on the next runs until it
+   expires (then just sign in again).
+
+**If the automatic delivery fails**
+
+- The extension's Connect page shows the token with a **Copy** button:
+  copy it, then press **Paste token…** in the capturer and paste.
+- Without any extension, **Paste token…** always works: sign in at
+  `f1tv.formula1.com`, open DevTools (F12) → **Application** → **Cookies**
+  → `https://f1tv.formula1.com`, copy the **value** of the `login-session`
+  cookie and paste it (the raw subscription JWT is accepted too).
+
 ![Capturer recording the live stream during a race, authenticated with F1TV](docs/capture.png)
 
 ## Features
@@ -201,6 +256,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python tests\replay_check.py  # real Fast-F1 integration (downloads data)
 .venv\Scripts\python tests\updater_check.py # updater: versions, zip layout, install script
 .venv\Scripts\python tests\sector_bounds_check.py # official sectors: decode, bounds, anchoring
+.venv\Scripts\python tests\auth_check.py    # F1TV sign-in: token parsing + PNA header
 ```
 
 ## Technical notes

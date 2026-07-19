@@ -7,21 +7,64 @@ una suscripción F1TV activa; sin token se intenta sin autenticación.
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
+import urllib.parse
 import webbrowser
 
 from PySide6.QtCore import QTimer, Signal, QObject
 from PySide6.QtWidgets import (
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
-    QWidget,
+    QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QMessageBox,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 from . import __version__, config
 from .sources.live import LiveSource
 from .ui import theme
 from .ui.update_dialog import run_check
+
+
+def _pna_handler(base):
+    """Handler del servidor de auth con el header de Private/Local Network
+    Access: Chrome 130+ bloquea con "Failed to fetch" cualquier pedido de una
+    página/extensión hacia localhost si el preflight no lo trae (por eso la
+    extensión vieja de FastF1 fallaba con "Could not connect to the local
+    FastF1 application")."""
+    class _Handler(base):
+        def _send_cors_headers(self):
+            super()._send_cors_headers()
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+    return _Handler
+
+
+def extract_subscription_token(text: str) -> str | None:
+    """Saca el subscriptionToken de lo que el usuario pegue: la cookie
+    login-session (JSON, quizá URL-encodeada) o el JWT pelado."""
+    text = (text or "").strip().strip('"')
+    if not text:
+        return None
+    for candidate in (text, urllib.parse.unquote(text)):
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            tok = data.get("data", {}).get("subscriptionToken") or \
+                data.get("subscriptionToken")
+            if isinstance(tok, str) and tok:
+                return tok
+    # JWT crudo (header.payload.firma, base64url)
+    if text.count(".") == 2 and text[:2] == "ey":
+        return text
+    return None
+
+
+def save_token(token: str) -> None:
+    from fastf1.internals import f1auth
+    f1auth._subscription_token = token
+    f1auth.AUTH_DATA_FILE.write_text(token)
 
 
 class _AuthWorker(QObject):
@@ -42,8 +85,9 @@ class _AuthWorker(QObject):
 
             from fastf1.internals import f1auth
 
+            handler = _pna_handler(f1auth.AuthHandler)
             f1auth._auth_finished.clear()
-            httpd = HTTPServer(("127.0.0.1", 0), f1auth.AuthHandler)
+            httpd = HTTPServer(("127.0.0.1", 0), handler)
             port = httpd.server_port
             server = threading.Thread(target=httpd.serve_forever, daemon=True)
             server.start()
@@ -54,7 +98,7 @@ class _AuthWorker(QObject):
                 class _V6Server(HTTPServer):
                     address_family = socket.AF_INET6
 
-                httpd6 = _V6Server(("::1", port), f1auth.AuthHandler)
+                httpd6 = _V6Server(("::1", port), handler)
                 threading.Thread(
                     target=httpd6.serve_forever, daemon=True
                 ).start()
@@ -64,7 +108,7 @@ class _AuthWorker(QObject):
             self.progress.emit(
                 f"Waiting for browser sign-in (up to {self.TIMEOUT_S // 60}"
                 f" min) — keep this window open.\nIf the browser did not"
-                f" open, go to: {url}"
+                f" open, go to: {url}\nIf it fails, use \"Paste token…\"."
             )
             webbrowser.open(url)
             ok = f1auth._auth_finished.wait(timeout=self.TIMEOUT_S)
@@ -73,7 +117,7 @@ class _AuthWorker(QObject):
                 httpd6.shutdown()
             token = f1auth._subscription_token if ok else None
             if token:
-                f1auth.AUTH_DATA_FILE.write_text(token)
+                save_token(token)
                 self.done.emit("Signed in — F1TV token saved.")
             else:
                 self.done.emit("Sign-in timed out or was cancelled.")
@@ -116,8 +160,15 @@ class CaptureWindow(QWidget):
         self.toggle_btn.clicked.connect(self._toggle)
         self.auth_btn = QPushButton("Sign in with F1TV…")
         self.auth_btn.clicked.connect(self._sign_in)
+        self.paste_btn = QPushButton("Paste token…")
+        self.paste_btn.setToolTip(
+            "If the browser sign-in fails (e.g. the FastF1 extension can't\n"
+            "reach the app), paste the F1TV login-session cookie or token here."
+        )
+        self.paste_btn.clicked.connect(self._paste_token)
         buttons.addWidget(self.toggle_btn)
         buttons.addWidget(self.auth_btn)
+        buttons.addWidget(self.paste_btn)
         buttons.addStretch(1)
         self.version_btn = QPushButton(f"v{__version__}")
         self.version_btn.setFlat(True)
@@ -158,6 +209,27 @@ class CaptureWindow(QWidget):
             self.token_label.setText("token found (authenticated)")
         else:
             self.token_label.setText("no token — sign in for full live data")
+
+    def _paste_token(self) -> None:
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Paste F1TV token",
+            "Sign in at f1tv.formula1.com, then in DevTools open\n"
+            "Application → Cookies → the 'login-session' cookie and paste its\n"
+            "value here (or paste the subscription token / JWT directly):",
+        )
+        if not ok:
+            return
+        token = extract_subscription_token(text)
+        if token is None:
+            QMessageBox.warning(
+                self, "F1 Live Telemetry",
+                "Could not find a token in what you pasted. Expected the\n"
+                "'login-session' cookie value or a JWT (starts with 'ey').",
+            )
+            return
+        save_token(token)
+        self.status_label.setText("F1TV token saved from paste.")
+        self._update_token_label()
 
     def _start(self) -> None:
         rec_dir = config.recordings_dir()

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>F1 Live Telemetry — Connect</title>
+  <style>
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #111318;
+      color: #e8eaed;
+      margin: 0;
+      display: flex;
+      justify-content: center;
+    }
+    .card {
+      max-width: 560px;
+      margin-top: 60px;
+      padding: 28px 32px;
+      background: #191c23;
+      border: 1px solid #2a2e37;
+      border-radius: 12px;
+      text-align: center;
+    }
+    h1 { font-size: 1.4em; margin: 0 0 6px 0; }
+    .sub { color: #9aa0a6; margin-bottom: 20px; }
+    button {
+      background: #4c8dff;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 12px 28px;
+      font-size: 1em;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.1); }
+    #status { margin-top: 18px; min-height: 40px; color: #9aa0a6; }
+    #status.ok { color: #2fbf71; font-weight: 600; }
+    #status.warn { color: #d6be3c; }
+    #status.err { color: #ff6b6b; }
+    #tokenbox { display: none; margin-top: 14px; }
+    #token {
+      width: 100%;
+      height: 84px;
+      background: #111318;
+      color: #e8eaed;
+      border: 1px solid #2a2e37;
+      border-radius: 6px;
+      font-family: Consolas, monospace;
+      font-size: 0.8em;
+      box-sizing: border-box;
+    }
+    #copy { margin-top: 8px; background: #2fbf71; }
+    .foot { margin-top: 22px; font-size: 0.8em; color: #9aa0a6; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Signed in with Formula 1</h1>
+    <div class="sub">Now hand the F1TV token to the F1 Live Telemetry app.</div>
+    <button id="connect">Connect the app</button>
+    <div id="status">Connecting…</div>
+    <div id="tokenbox">
+      <textarea id="token" readonly></textarea>
+      <br>
+      <button id="copy">Copy token</button>
+    </div>
+    <div class="foot">
+      Unofficial companion for the F1 Live Telemetry capturer (FastF1-compatible
+      sign-in). Not associated with Formula 1 companies.
+    </div>
+  </div>
+  <script src="connect.js"></script>
+</body>
+</html>

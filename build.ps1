@@ -12,6 +12,8 @@ if (-not (Test-Path $python)) {
 & $python -m PyInstaller --noconfirm --clean (Join-Path $root "f1telem.spec")
 if ($LASTEXITCODE -eq 0) {
     Copy-Item (Join-Path $root "capture.ps1") (Join-Path $root "dist\F1LiveTelemetry\") -Force
+    # extensión de Chrome para el login F1TV (cargar descomprimida)
+    Copy-Item (Join-Path $root "extension") (Join-Path $root "dist\F1LiveTelemetry\") -Recurse -Force
     # zip listo para subir al release de GitHub (el actualizador lo busca por
     # este nombre y espera la carpeta F1LiveTelemetry\ en la raíz del zip)
     $zip = Join-Path $root "dist\F1LiveTelemetry-win64.zip"

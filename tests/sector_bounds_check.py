@@ -88,6 +88,35 @@ src._on_timing({"Lines": {"16": {"Sectors": [{"Value": ""}, {"Value": "bad"}]}}}
 check(not any(r[0] == "16" for r in sector_reports),
       "decoder: Value vacío o inválido no emite tiempo")
 
+# ---------------------------------------- trazado del circuito (MultiViewer)
+
+from f1telem.sources.live import _circuit_rows  # noqa: E402
+
+outline, corners = _circuit_rows({
+    "x": list(range(20)), "y": list(range(20)),
+    "corners": [
+        {"number": 1, "length": 3818.58, "trackPosition": {"x": -2268.2, "y": 4480.0}},
+        {"number": 2, "trackPosition": {"x": 0, "y": 0}},  # sin length: fuera
+    ],
+})
+check(outline is not None and len(outline[0]) == 20, "circuito: trazado parseado")
+check(corners == [("T1", 381.858, -2268.2, 4480.0)],
+      f"circuito: curva con distancia en metros ({corners})")
+check(_circuit_rows({"x": [1], "y": [1]})[0] is None,
+      "circuito: trazado corto descartado")
+
+fetches: list = []
+src._fetch_circuit = lambda key, year: fetches.append((key, year))
+session_info = {"Meeting": {"Name": "Belgian GP",
+                            "Circuit": {"Key": 7, "ShortName": "Spa"}},
+                "Name": "Race", "StartDate": "2026-07-19T15:00:00"}
+src._on_session_info(session_info)
+src._on_session_info(session_info)  # segundo aviso no re-pide
+import time as _time  # noqa: E402
+_time.sleep(0.3)  # el fetch corre en un hilo propio
+check(fetches == [(7, "2026")],
+      f"circuito: SessionInfo dispara UN fetch con clave y año ({fetches})")
+
 # ------------------------------------------------- derivación de límites
 
 L = 6000.0
