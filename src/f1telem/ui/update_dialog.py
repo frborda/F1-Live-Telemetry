@@ -41,9 +41,12 @@ class _InstallWorker(QObject):
     done = Signal()
     failed = Signal(str)         # "" cuando el usuario canceló
 
-    def __init__(self, info: updater.UpdateInfo):
+    def __init__(self, info: updater.UpdateInfo, do_main: bool = True,
+                 do_capture: bool = True):
         super().__init__()
         self.info = info
+        self.do_main = do_main
+        self.do_capture = do_capture
         self.cancel = threading.Event()
 
     def start(self) -> None:
@@ -61,7 +64,9 @@ class _InstallWorker(QObject):
             self.progress.emit(100, "Extracting…")
             payload = updater.extract(zip_path)
             self.progress.emit(100, "Starting installer…")
-            updater.launch_installer(payload, sys.argv[1:])
+            updater.launch_installer(payload, sys.argv[1:],
+                                     do_main=self.do_main,
+                                     do_capture=self.do_capture)
             self.done.emit()
         except updater.InstallCancelled:
             self.failed.emit("")
@@ -72,10 +77,14 @@ class _InstallWorker(QObject):
 class UpdateDialog(QDialog):
     """Muestra la versión disponible con sus notas y ofrece instalarla."""
 
-    def __init__(self, info: updater.UpdateInfo, cfg: dict, parent=None):
+    def __init__(self, info: updater.UpdateInfo, cfg: dict, parent=None,
+                 allow_install: bool = True):
         super().__init__(parent)
         self.info = info
         self.cfg = cfg
+        # el capturador no se auto-instala: su carpeta está mapeada mientras
+        # graba; la actualización la aplica la app principal
+        self._allow_install = allow_install and updater.can_autoupdate()
         self._worker: _InstallWorker | None = None
         self.setWindowTitle(f"{_TITLE} — Update")
         self.setMinimumWidth(540)
@@ -91,6 +100,20 @@ class UpdateDialog(QDialog):
         notes.setMarkdown(info.notes.strip() or "*(no release notes)*")
         notes.setMaximumHeight(240)
         lay.addWidget(notes)
+        # qué instalar: la app y el capturador se actualizan por separado
+        self.main_check = QCheckBox("Update the main app (it will restart)")
+        self.main_check.setChecked(True)
+        self.cap_check = QCheckBox(
+            "Update the capturer (replaced once it is closed — a running"
+            " capture keeps recording)"
+        )
+        self.cap_check.setChecked(True)
+        if self._allow_install:
+            lay.addWidget(self.main_check)
+            lay.addWidget(self.cap_check)
+        else:
+            self.main_check.setVisible(False)
+            self.cap_check.setVisible(False)
         self.startup_check = QCheckBox("Check for updates at startup")
         self.startup_check.setChecked(
             bool(self.cfg.setdefault("updates", {}).get("check_on_startup", True))
@@ -107,12 +130,13 @@ class UpdateDialog(QDialog):
 
         btns = QHBoxLayout()
         self.install_btn = QPushButton("Download and install")
-        if not updater.can_autoupdate():
-            # desde el código fuente (o sin permisos) solo abrimos la descarga
+        if not self._allow_install:
+            # desde el código, sin permisos, o en el capturador: solo la web
             self.install_btn.setText("Open download page")
             self.install_btn.setToolTip(
-                "Auto-install only works from the packaged build with write"
-                " access to its folder."
+                "Auto-install runs from the main app's packaged build. In the"
+                " capturer, update from the main app so the capture keeps"
+                " running."
             )
         self.web_btn = QPushButton("View on GitHub")
         self.skip_btn = QPushButton("Skip this version")
@@ -139,19 +163,29 @@ class UpdateDialog(QDialog):
         self.reject()
 
     def _install(self) -> None:
-        if not updater.can_autoupdate():
+        if not self._allow_install:
             webbrowser.open(self.info.html_url)
             self.accept()
             return
         if self._worker is not None:  # segundo clic = cancelar la descarga
             self._worker.cancel.set()
             return
+        do_main = self.main_check.isChecked()
+        do_capture = self.cap_check.isChecked()
+        if not (do_main or do_capture):
+            QMessageBox.information(
+                self, _TITLE, "Pick at least one component to update."
+            )
+            return
+        self._did_main = do_main
         self.skip_btn.setEnabled(False)
         self.later_btn.setEnabled(False)
+        self.main_check.setEnabled(False)
+        self.cap_check.setEnabled(False)
         self.install_btn.setText("Cancel")
         self.bar.setVisible(True)
         self.status_label.setText("Starting download…")
-        self._worker = _InstallWorker(self.info)
+        self._worker = _InstallWorker(self.info, do_main, do_capture)
         self._worker.progress.connect(self._on_progress)
         self._worker.done.connect(self._on_done)
         self._worker.failed.connect(self._on_failed)
@@ -163,10 +197,23 @@ class UpdateDialog(QDialog):
 
     def _on_done(self) -> None:
         self._worker = None
-        self.status_label.setText("Update ready — restarting…")
-        # el instalador espera a que la app termine; cerrar todo la termina
-        self.accept()
-        QApplication.closeAllWindows()
+        if getattr(self, "_did_main", True):
+            self.status_label.setText("Update ready — restarting…")
+            # el instalador espera a que la app termine; cerrar todo la termina
+            self.accept()
+            QApplication.closeAllWindows()
+            return
+        # solo el capturador: la app sigue abierta; el instalador queda en
+        # segundo plano y reemplaza el capturador apenas se cierre
+        self.bar.setVisible(False)
+        self.install_btn.setEnabled(False)
+        self.install_btn.setText("Installer running")
+        self.later_btn.setEnabled(True)
+        self.later_btn.setText("Close")
+        self.status_label.setText(
+            "Installer running in the background: the capturer will be"
+            " replaced as soon as it is closed (waits up to 60 min)."
+        )
 
     def _on_failed(self, message: str) -> None:
         self._worker = None
@@ -185,12 +232,13 @@ class UpdateDialog(QDialog):
         super().closeEvent(event)
 
 
-def run_check(parent, cfg: dict, silent: bool) -> None:
+def run_check(parent, cfg: dict, silent: bool, allow_install: bool = True) -> None:
     """Busca actualizaciones y muestra el resultado.
 
     silent=True (arranque): solo aparece el diálogo si hay una versión nueva
     no omitida; los errores de red se ignoran. silent=False (a demanda):
-    también avisa "estás al día" o el error.
+    también avisa "estás al día" o el error. allow_install=False (capturador):
+    el diálogo no ofrece auto-instalar, solo abrir la descarga.
     """
     if getattr(parent, "_update_checker", None) is not None:
         return  # ya hay una comprobación en marcha
@@ -208,7 +256,7 @@ def run_check(parent, cfg: dict, silent: bool) -> None:
         skip = str(cfg.get("updates", {}).get("skip_version", ""))
         if silent and info.version == skip:
             return
-        dialog = UpdateDialog(info, cfg, parent)
+        dialog = UpdateDialog(info, cfg, parent, allow_install=allow_install)
         dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.show()
 

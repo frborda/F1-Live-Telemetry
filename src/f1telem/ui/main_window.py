@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap, QPolygonF, QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMenu, QMessageBox, QPushButton, QSlider, QSpinBox, QSplitter,
-    QStackedWidget, QVBoxLayout, QWidget,
+    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QSlider, QSpinBox,
+    QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .. import __version__, config
@@ -19,17 +23,25 @@ from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplayS
 from . import theme
 from .charts import RollingChart, WrapChart
 from .docks import Detachable
+from .notifications import NotificationCenter, NotificationsPanel
+from .pitlane import PitlaneView
 from .qualy_view import QualyView
+from .race_control import RaceControlPanel
+from .session_strip import SessionStrip
+from .strategy import StrategyView
 from .timing_view import TimingView, fmt_laptime
 from .tower import TimingTower
+from .trace_chart import TraceChart
 from .track_map import TrackMapView
 from .update_dialog import run_check
+from .weather import WeatherChart, WeatherNowPanel
 
 MODES = [
     ("Race (rolling window)", 0),
     ("Race 2 (fixed track)", 1),
     ("Quali (comparison)", 2),
     ("Times / Gap", 3),
+    ("Race trace (gap evolution)", 4),
 ]
 
 # ventana X en vueltas para los modos sin ventana fija (0 = toda la sesión)
@@ -188,9 +200,19 @@ class MainWindow(QMainWindow):
         self.chart_wrap = WrapChart(self.hub)
         self.chart_qualy = QualyView(self.hub)
         self.chart_timing = TimingView(self.hub, self.cfg)
-        self.charts = [self.chart_rolling, self.chart_wrap, self.chart_qualy, self.chart_timing]
+        self.chart_trace = TraceChart(self.hub, self.cfg)
+        self.charts = [self.chart_rolling, self.chart_wrap, self.chart_qualy,
+                       self.chart_timing, self.chart_trace]
         self.track_map = TrackMapView(self.hub)
         self.tower = TimingTower(self.hub, self.cfg)
+        self.session_strip = SessionStrip(self.hub)
+        self.race_control_view = RaceControlPanel(self.hub)
+        self.strategy_view = StrategyView(self.hub)
+        self.pitlane_view = PitlaneView(self.hub)
+        self.notifier = NotificationCenter(self.hub, self.cfg, self)
+        self.notifications_view = NotificationsPanel(self.notifier, self.cfg)
+        self.weather_now = WeatherNowPanel(self.hub)
+        self.weather_chart = WeatherChart(self.hub)
         self._tick_n = 0
 
         self._build_ui()
@@ -200,6 +222,13 @@ class MainWindow(QMainWindow):
         self._timer.setInterval(33)  # 30 fps: el paneo suavizado lo necesita
         self._timer.timeout.connect(self._tick)
         self._timer.start()
+        # espera de la fuente Capture: sondear hasta que el capturador
+        # empiece a escribir datos y conectar solo
+        self._cap_timer = QTimer(self)
+        self._cap_timer.setInterval(700)
+        self._cap_timer.timeout.connect(self._poll_capture_ready)
+        self._cap_waiting = False
+        self._cap_baseline: dict = {}
         self._laps_timer = QTimer(self)
         self._laps_timer.setInterval(2000)
         self._laps_timer.timeout.connect(self._refresh_ref_laps)
@@ -239,10 +268,14 @@ class MainWindow(QMainWindow):
         src_box = QGroupBox("Data source")
         src_lay = QVBoxLayout(src_box)
         self.source_combo = QComboBox()
-        self.source_combo.addItems([
-            "Demo (synthetic)", "Replay (FastF1 historical)",
-            "Live (F1 Live Timing)", "Capture (recorded live)",
-        ])
+        # el visualizador consume histórico o captura; el vivo lo maneja el
+        # capturador (exe propio). Demo y Live directo quedan como fuentes de
+        # desarrollo detrás de F1TELEM_DEV_SOURCES=1.
+        self.source_combo.addItem("Replay (FastF1 historical)", "replay")
+        self.source_combo.addItem("Capture (live / imported)", "capture")
+        if os.environ.get("F1TELEM_DEV_SOURCES"):
+            self.source_combo.addItem("Live (F1 Live Timing)", "live")
+            self.source_combo.addItem("Demo (synthetic)", "demo")
         src_lay.addWidget(self.source_combo)
 
         rep = self.cfg["replay"]
@@ -347,17 +380,36 @@ class MainWindow(QMainWindow):
             ("race2_chart", "Race 2 chart"),
             ("quali_view", "Quali comparison"),
             ("times_gap", "Times / Gap"),
+            ("race_trace", "Race trace"),
         ]
         for chart, (pid, title) in zip(self.charts, chart_meta):
             holder = Detachable(pid, title, chart, keep_placeholder=True)
             self.chart_panels.append(holder)
             self.stack.addWidget(holder)
-        # panel derecho: torre arriba, mapa debajo (ambos desacoplables)
+        # panel derecho: torre arriba, mapa debajo (ambos desacoplables) y
+        # los paneles de contexto (estrategia, dirección de carrera, clima),
+        # ocultos por defecto — se activan desde Panels…
         self.tower_panel = Detachable("tower", "Timing tower", self.tower)
         self.map_panel = Detachable("map", "Track map", self.track_map)
+        self.strategy_panel = Detachable("strategy", "Tyre strategy",
+                                         self.strategy_view)
+        self.pitlane_panel = Detachable("pitlane", "Pit lane",
+                                        self.pitlane_view)
+        self.notifications_panel = Detachable("notifications", "Notifications",
+                                              self.notifications_view)
+        self.race_control_panel = Detachable("race_control", "Race control",
+                                             self.race_control_view)
+        self.weather_panel = Detachable("weather", "Weather", self.weather_now)
+        self.weather_chart_panel = Detachable("weather_chart",
+                                              "Weather evolution",
+                                              self.weather_chart)
         self.right_split = QSplitter(Qt.Vertical)
         self.right_split.addWidget(self.tower_panel)
         self.right_split.addWidget(self.map_panel)
+        for panel in (self.strategy_panel, self.pitlane_panel,
+                      self.race_control_panel, self.weather_panel,
+                      self.weather_chart_panel, self.notifications_panel):
+            self.right_split.addWidget(panel)
         self.right_split.setStretchFactor(0, 1)
         self.right_split.setStretchFactor(1, 1)
         self.right_split.setMinimumWidth(300)
@@ -373,6 +425,9 @@ class MainWindow(QMainWindow):
         center = QWidget()
         center_lay = QVBoxLayout(center)
         center_lay.setContentsMargins(0, 0, 0, 0)
+        # tira de estado de sesión (bandera, vuelta, reloj, race control)
+        self.session_panel = Detachable("session", "Session", self.session_strip)
+        center_lay.addWidget(self.session_panel)
         center_lay.addWidget(self.splitter, stretch=1)
         self.seek_row = QWidget()
         seek_lay = QHBoxLayout(self.seek_row)
@@ -408,6 +463,13 @@ class MainWindow(QMainWindow):
         self._panels = {
             "tower": self.tower_panel,
             "map": self.map_panel,
+            "strategy": self.strategy_panel,
+            "pitlane": self.pitlane_panel,
+            "notifications": self.notifications_panel,
+            "race_control": self.race_control_panel,
+            "weather": self.weather_panel,
+            "weather_chart": self.weather_chart_panel,
+            "session": self.session_panel,
             "times_tables": self.chart_timing.tables_panel,
             "quali_cards": self.chart_qualy.cards_panel,
             "source": self.source_panel,
@@ -472,26 +534,30 @@ class MainWindow(QMainWindow):
             lambda: run_check(self, self.cfg, silent=False)
         )
 
-    def _source_kind_changed(self, kind: int) -> None:
+    def _source_kind_changed(self, _index: int) -> None:
         """Year/GP/Session solo aplican a Replay; Speed no aplica a Live."""
+        kind = self.source_combo.currentData()
         for row in (0, 1, 2):
-            self._replay_form.setRowVisible(row, kind == 1)
-        self._replay_form.setRowVisible(3, kind != 2)
+            self._replay_form.setRowVisible(row, kind == "replay")
+        self._replay_form.setRowVisible(3, kind != "live")
 
     # ------------------------------------------------------------- conexión
 
     def _toggle_connection(self) -> None:
-        if self.source is not None:
+        if self._cap_waiting:
+            self._end_capture_wait()
+            self._on_source_status("Cancelled — not connected.")
+        elif self.source is not None:
             self._disconnect()
         else:
             self._connect()
 
     def _connect(self) -> None:
-        kind = self.source_combo.currentIndex()
+        kind = self.source_combo.currentData()
         speed = float(self.speed_combo.currentData())
-        if kind == 0:
+        if kind == "demo":
             source = DemoSource(speed=speed)
-        elif kind == 1:
+        elif kind == "replay":
             self._save_replay_cfg()
             source = ReplaySource(
                 year=self.year_spin.value(),
@@ -499,21 +565,97 @@ class MainWindow(QMainWindow):
                 session=self.session_combo.currentText(),
                 speed=speed,
             )
-        elif kind == 2:
+        elif kind == "live":
             source = LiveSource()
         else:
-            # Capture: seguir el archivo más reciente grabado por el capturador
-            captures = sorted(config.recordings_dir().glob("*.jsonl"),
-                              key=lambda p: p.stat().st_mtime)
-            if not captures:
-                QMessageBox.warning(
-                    self, "F1 Live Telemetry",
-                    "No capture files found.\nRun the capturer first: "
-                    "F1LiveTelemetry.exe --capture",
-                )
-                return
-            source = CaptureSource(captures[-1], speed=speed)
+            # Capture: el visualizador gestiona el capturador — si ya hay un
+            # archivo creciendo se conecta ya; si no, abre el capturador
+            # (cuando hace falta) y conecta solo al empezar a fluir datos
+            self._begin_capture_wait()
+            return
+        self._start_source(source)
 
+    # ------------------------------------------ fuente Capture (capturador)
+
+    def _active_capture(self):
+        """Archivo de captura escribiéndose ahora mismo (mtime fresco)."""
+        now = time.time()
+        try:
+            candidates = [
+                p for p in config.recordings_dir().glob("*.jsonl")
+                if now - p.stat().st_mtime < 5.0 and p.stat().st_size > 0
+            ]
+        except OSError:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime, default=None)
+
+    def _begin_capture_wait(self) -> None:
+        rec = config.recordings_dir()
+        rec.mkdir(parents=True, exist_ok=True)
+        active = self._active_capture()
+        if active is not None:
+            self._start_source(CaptureSource(
+                active, speed=float(self.speed_combo.currentData())))
+            return
+        launched = False
+        if (not config.capture_running()
+                and not os.environ.get("F1TELEM_NO_CAPTURE_SPAWN")):
+            launched = self._launch_capturer()
+        self._cap_baseline = {}
+        for p in rec.glob("*.jsonl"):
+            try:
+                self._cap_baseline[p] = p.stat().st_size
+            except OSError:
+                pass
+        self._cap_waiting = True
+        self.connect_btn.setText("Cancel")
+        self.source_combo.setEnabled(False)
+        self._on_source_status(
+            ("Capturer opened — waiting for it to send data (start a live "
+             "capture or an import there)..." if launched else
+             "Waiting for capturer data (start a live capture or an import "
+             "in the capturer)..."))
+        self._cap_timer.start()
+
+    def _launch_capturer(self) -> bool:
+        try:
+            if getattr(sys, "frozen", False):
+                exe = Path(sys.executable).parent / "capture" / "F1TelemCapture.exe"
+                if not exe.exists():
+                    return False
+                subprocess.Popen([str(exe)], cwd=str(exe.parent))
+            else:
+                env = dict(os.environ)
+                src_dir = Path(__file__).resolve().parents[2]
+                env["PYTHONPATH"] = (str(src_dir) + os.pathsep
+                                     + env.get("PYTHONPATH", ""))
+                subprocess.Popen([sys.executable, "-m", "f1telem", "--capture"],
+                                 env=env)
+            return True
+        except OSError:
+            return False
+
+    def _poll_capture_ready(self) -> None:
+        """Conecta apenas algún archivo de captura crece (o aparece)."""
+        try:
+            for p in config.recordings_dir().glob("*.jsonl"):
+                size = p.stat().st_size
+                if size > self._cap_baseline.get(p, 0):
+                    self._end_capture_wait()
+                    self._start_source(CaptureSource(
+                        p, speed=float(self.speed_combo.currentData())))
+                    return
+        except OSError:
+            pass
+
+    def _end_capture_wait(self) -> None:
+        self._cap_timer.stop()
+        self._cap_waiting = False
+        self._cap_baseline = {}
+        self.connect_btn.setText("Connect")
+        self.source_combo.setEnabled(True)
+
+    def _start_source(self, source: BaseSource) -> None:
         self.hub.reset()
         for chart in self.charts:
             chart.clear_data()
@@ -530,6 +672,11 @@ class MainWindow(QMainWindow):
         source.sectorYellows.connect(self.hub.on_sector_yellows)
         source.sectorTimes.connect(self.hub.on_sector_times)
         source.segmentStatus.connect(self.hub.on_segments)
+        source.pitLane.connect(self.hub.on_pit_lane)
+        source.raceControl.connect(self.hub.on_race_control)
+        source.sessionClock.connect(self.hub.on_session_clock)
+        source.lapCount.connect(self.hub.on_lap_count)
+        source.sessionMeta.connect(self.hub.on_session_meta)
         # Live/Capture: el marco de vuelta llega con la latencia del feed y
         # se re-ancla con los S1 oficiales
         self.hub.live_frames = isinstance(source, (LiveSource, CaptureSource))
@@ -540,6 +687,14 @@ class MainWindow(QMainWindow):
         self.lap_ruler.set_status([])
         self.pause_btn.setChecked(False)
         self.tower.clear_data()
+        self.session_strip.clear_data()
+        self.race_control_view.clear_data()
+        self.strategy_view.clear_data()
+        self.pitlane_view.clear_data()
+        self.notifier.reset()
+        self.notifications_view.clear_data()
+        self.weather_now.clear_data()
+        self.weather_chart.clear_data()
         if isinstance(source, (ReplaySource, CaptureSource)):
             source.progress.connect(self._on_progress)
             source.seekReset.connect(self._on_seek_reset)
@@ -666,6 +821,7 @@ class MainWindow(QMainWindow):
         self.chart_rolling.clear_data()
         self.chart_wrap.clear_data()
         self.chart_timing.clear_data()
+        self.chart_trace.clear_data()
         self.track_map.clear_data()
         self.tower.clear_data()
         self.chart_qualy.clear_stream_data()
@@ -875,7 +1031,13 @@ class MainWindow(QMainWindow):
     # quali_ref y timeline se auto-administran y los centrales acoplados son
     # la página de su modo
     _PERSIST_VISIBLE = ("tower", "map", "times_tables", "quali_cards",
-                        "source", "drivers", "mode")
+                        "source", "drivers", "mode", "session", "strategy",
+                        "pitlane", "notifications", "race_control", "weather",
+                        "weather_chart")
+    # paneles de contexto: ocultos hasta que el usuario los active
+    _DEFAULT_HIDDEN = frozenset(
+        {"strategy", "pitlane", "notifications", "race_control", "weather",
+         "weather_chart"})
 
     def _show_panels_menu(self) -> None:
         """Menú de paneles: mostrar/ocultar cada uno (con ⧉ en la barrita de
@@ -893,7 +1055,91 @@ class MainWindow(QMainWindow):
             action.toggled.connect(
                 lambda on, p=panel: p.set_panel_visible(on)
             )
+        # perfiles de disposición con nombre: guardan y reaplican la
+        # combinación completa de paneles (flotantes, fijados, visibilidad,
+        # divisores y geometría de la ventana)
+        menu.addSeparator()
+        layouts = self.cfg.get("layouts", {})
+        lay_menu = menu.addMenu("Layout profiles")
+        save_action = lay_menu.addAction("Save current as…")
+        save_action.triggered.connect(self._save_layout_profile)
+        if layouts:
+            lay_menu.addSeparator()
+            for name in sorted(layouts):
+                action = lay_menu.addAction(name)
+                action.triggered.connect(
+                    lambda _=False, n=name: self._apply_layout_profile(n))
+            delete_menu = lay_menu.addMenu("Delete profile")
+            for name in sorted(layouts):
+                action = delete_menu.addAction(name)
+                action.triggered.connect(
+                    lambda _=False, n=name: self._delete_layout_profile(n))
         menu.exec(self.panels_btn.mapToGlobal(self.panels_btn.rect().bottomLeft()))
+
+    # -------------------------------------------------- perfiles de layout
+
+    def _save_layout_profile(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Save layout profile",
+            "Profile name (e.g. \"Race 3 monitors\"):")
+        name = name.strip()
+        if not ok or not name:
+            return
+        profile = {
+            "visible": {pid: self._panels[pid].is_panel_visible()
+                        for pid in self._PERSIST_VISIBLE},
+            "float": {pid: panel.save_state()
+                      for pid, panel in self._panels.items() if panel.floating},
+            "win_max": self.isMaximized(),
+        }
+        g = self.normalGeometry()
+        profile["win_geom"] = [g.x(), g.y(), g.width(), g.height()]
+        for key, split in (("split_main", self.splitter),
+                           ("split_right", self.right_split)):
+            sizes = split.sizes()
+            if all(v > 0 for v in sizes):
+                profile[key] = sizes
+        self.cfg.setdefault("layouts", {})[name] = profile
+        config.save_config(self.cfg)
+
+    def _apply_layout_profile(self, name: str) -> None:
+        profile = self.cfg.get("layouts", {}).get(name)
+        if not isinstance(profile, dict):
+            return
+        float_states = profile.get("float", {})
+        # primero acoplar todo lo flotante que el perfil no quiere flotante
+        for pid, panel in self._panels.items():
+            if panel.floating:
+                panel.attach()
+        visible = profile.get("visible", {})
+        for pid in self._PERSIST_VISIBLE:
+            self._panels[pid].apply_visible(
+                bool(visible.get(pid, pid not in self._DEFAULT_HIDDEN)))
+        for pid, state in float_states.items():
+            panel = self._panels.get(pid)
+            if panel is not None:
+                panel.restore_state(state)
+        geom = profile.get("win_geom")
+        if isinstance(geom, list) and len(geom) == 4:
+            self.setGeometry(*[int(v) for v in geom])
+        self.setWindowState(
+            Qt.WindowMaximized if profile.get("win_max") else Qt.WindowNoState)
+        for key, split in (("split_main", self.splitter),
+                           ("split_right", self.right_split)):
+            sizes = profile.get(key)
+            if isinstance(sizes, list) and sizes and all(
+                    isinstance(v, (int, float)) for v in sizes):
+                split.setSizes([int(v) for v in sizes])
+        self._set_timeline_available(self._timeline_on)
+        self._set_ref_available(self.mode_combo.currentIndex() == 2)
+        self._sync_right_panel()
+        self._on_panel_state()  # el perfil aplicado pasa a ser el estado actual
+
+    def _delete_layout_profile(self, name: str) -> None:
+        layouts = self.cfg.get("layouts", {})
+        if name in layouts:
+            del layouts[name]
+            config.save_config(self.cfg)
 
     def _set_timeline_available(self, on: bool) -> None:
         """La línea de tiempo aplica solo a replay/captura; acoplada se
@@ -932,7 +1178,8 @@ class MainWindow(QMainWindow):
         panels_cfg = self.cfg.get("panels", {})
         visible = panels_cfg.get("visible", {})
         for pid in self._PERSIST_VISIBLE:
-            self._panels[pid].apply_visible(bool(visible.get(pid, True)))
+            self._panels[pid].apply_visible(
+                bool(visible.get(pid, pid not in self._DEFAULT_HIDDEN)))
         # copia: restore_state dispara stateChanged -> _on_panel_state, que
         # reescribe este mismo dict mientras se itera
         for pid, state in list(panels_cfg.get("float", {}).items()):
@@ -949,7 +1196,10 @@ class MainWindow(QMainWindow):
     def _sync_right_panel(self) -> None:
         self.right_split.setVisible(any(
             not p.floating and p.is_panel_visible()
-            for p in (self.tower_panel, self.map_panel)
+            for p in (self.tower_panel, self.map_panel, self.strategy_panel,
+                      self.pitlane_panel, self.race_control_panel,
+                      self.weather_panel, self.weather_chart_panel,
+                      self.notifications_panel)
         ))
 
     def _pause_toggled(self, on: bool) -> None:
@@ -984,6 +1234,17 @@ class MainWindow(QMainWindow):
         if self.tower.isVisible() and self._tick_n % 15 == 0:
             self.tower.refresh()
         if self._tick_n % 15 == 0:
+            # el gestor de notificaciones corre siempre (los popups no
+            # dependen de que su panel esté visible)
+            self.notifier.check()
+            # paneles de contexto (isVisible cubre acoplado y flotante)
+            if self.session_strip.isVisible():
+                self.session_strip.refresh()
+            for view in (self.race_control_view, self.strategy_view,
+                         self.pitlane_view, self.weather_now,
+                         self.weather_chart, self.notifications_view):
+                if view.isVisible():
+                    view.refresh()
             # sub-paneles flotantes de vistas no activas (y no flotantes)
             tables = self.chart_timing.tables_panel
             if (cur != 3 and not self.chart_panels[3].floating
@@ -1002,6 +1263,7 @@ class MainWindow(QMainWindow):
         self.meta_label.setText(meta)
 
     def closeEvent(self, event) -> None:
+        self._cap_timer.stop()
         self._disconnect()
         self._on_panel_state()  # persiste la geometría flotante actual
         for panel in self._panels.values():

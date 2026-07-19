@@ -297,6 +297,70 @@ check(m is not None and bool(np.isfinite(m).all()),
 sec3 = an3.sector_times("99", 2)
 check(abs(sum(sec3) - lt) < 0.05, "scale: S1+S2+S3 = vuelta con deriva")
 
+# ---------------------------------------- conexión a mitad de carrera
+
+# al conectar con la carrera iniciada, la distancia integrada de cada auto
+# arranca de 0 donde esté: sin proyección, la torre ordenaba mal hasta que
+# todos cruzaban la meta
+import math as _math  # noqa: E402
+
+hub6 = DataHub()
+hub6.live_frames = True
+hub6.on_track_length(L)
+_N = 720
+hub6.on_outline(([_math.cos(2 * _math.pi * k / _N) * 1000 for k in range(_N)],
+                 [_math.sin(2 * _math.pi * k / _N) * 1000 for k in range(_N)]))
+
+join_samples, join_pos = [], []
+for drv, phys0 in (("A", 4500.0), ("B", 1500.0)):  # A va físicamente adelante
+    t = 0.0
+    while t <= 20.0:  # 1000 m integrados desde la conexión
+        d = t * V
+        frac = ((phys0 + d) % L) / L
+        join_samples.append(Sample(
+            driver=drv, t=t, lap=44, dist_lap=d, dist_total=d, speed=V * 3.6,
+            throttle=0.0, brake=0.0, rpm=0.0, gear=0, drs=0,
+        ))
+        join_pos.append((drv, t, _math.cos(2 * _math.pi * frac) * 1000,
+                         _math.sin(2 * _math.pi * frac) * 1000))
+        t += 0.25
+hub6.on_batch(join_samples)
+hub6.on_positions(join_pos)
+an6 = TimingAnalyzer(hub6)
+
+off_a = hub6.provisional_start_offset("A")
+check(off_a == 0.0, f"mid-join: marco reescrito, offset residual 0 ({off_a})")
+d_last = float(hub6.buffers["A"].col("dist_lap")[-1])
+check(abs(d_last - 5500.0) < 60.0,
+      f"mid-join: dist_lap de A medida desde la meta real ({d_last:.0f} m)")
+check(an6.real_positions_ready("A") and an6.real_positions_ready("B"),
+      "mid-join: posiciones confiables con proyección, sin esperar el cruce")
+pos_a = float(an6.position_time("A")[0][-1])
+pos_b = float(an6.position_time("B")[0][-1])
+check(pos_a > pos_b, "mid-join: A ordena delante de B (posición física real)")
+check(abs(pos_a - (43 * L + 5500.0)) < 80.0,
+      f"mid-join: posición absoluta de A correcta ({pos_a:.0f})")
+lt_join = an6.lap_time("A", 44)
+check(lt_join != lt_join, "mid-join: la vuelta parcial de entrada no se cronometra")
+
+# muestras posteriores en el marco viejo se corrigen; al cruzar la meta la
+# corrección se retira (el decodificador ya ancla en la meta real)
+hub6.on_batch([Sample("A", 21.0, 44, 21.0 * V, 21.0 * V, V * 3.6,
+                      0.0, 0.0, 0.0, 0, 0)])
+d_new = float(hub6.buffers["A"].col("dist_lap")[-1])
+check(abs(d_new - (4500.0 + 21.0 * V)) < 60.0,
+      f"mid-join: muestra nueva corregida al marco real ({d_new:.0f} m)")
+hub6.on_batch([Sample("A", 31.0, 45, 50.0, 31.0 * V, V * 3.6,
+                      0.0, 0.0, 0.0, 0, 0)])
+check("A" not in hub6._dist_fix, "mid-join: la corrección se retira al cruzar")
+check(float(hub6.buffers["A"].col("dist_lap")[-1]) == 50.0,
+      "mid-join: tras el cruce las muestras quedan tal cual (ancla real)")
+
+# sin proyección todavía (sin posiciones), un tercer auto NO está listo
+hub6.on_batch([Sample("C", 0.0, 44, 400.0, 400.0, V * 3.6,
+                      0.0, 0.0, 0.0, 0, 0)])
+check(not an6.real_positions_ready("C"), "mid-join: sin proyección no está listo")
+
 # ------------------------------------------------- segmentos en el hub
 
 hub.on_segments([("44", 0, 0, 2049), ("44", 0, 5, 2051), ("44", 2, 3, 2064)])

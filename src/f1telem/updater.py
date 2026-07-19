@@ -118,7 +118,12 @@ def cleanup() -> None:
     """Borra restos de instalaciones anteriores (mejor esfuerzo)."""
     target = install_dir()
     if target is not None:
-        for leftover in (target / (EXE_NAME + ".old"), target / "_internal.old"):
+        leftovers = [
+            target / (EXE_NAME + ".old"), target / "_internal.old",
+            target / "capture" / "F1TelemCapture.exe.old",
+            target / "capture" / "_internal.old",
+        ]
+        for leftover in leftovers:
             try:
                 if leftover.is_dir():
                     shutil.rmtree(leftover)
@@ -180,16 +185,19 @@ def extract(zip_path: Path) -> Path:
     raise RuntimeError(f"{EXE_NAME} not found inside the downloaded zip.")
 
 
-# Script que aplica la actualización una vez cerrada la app. Espera a que no
-# quede ninguna instancia corriendo desde la carpeta destino, respalda exe y
-# _internal como *.old, copia la nueva versión y relanza; si la copia falla,
-# restaura el respaldo. Todo queda registrado en update.log.
+# Script que aplica la actualización de la app principal (F1LiveTelemetry).
+# La carpeta del capturador (Target\capture) tiene su propio _internal y solo
+# se actualiza si NO hay un capturador corriendo — así una captura en vivo no
+# se frena. Respalda exe y _internal como *.old y hace rollback si la copia
+# falla. Todo queda en update.log.
 _HELPER = r'''param(
     [int]$ProcId,
     [string]$Source,
     [string]$Target,
     [string]$LogPath,
-    [string]$RestartArgs = ""
+    [string]$RestartArgs = "",
+    [string]$DoMain = "1",
+    [string]$DoCapture = "1"
 )
 $ErrorActionPreference = "Stop"
 
@@ -207,61 +215,103 @@ function Retry([scriptblock]$Action, [int]$Times = 10) {
     }
 }
 
-$exeName = "F1LiveTelemetry"
-$exe = Join-Path $Target "$exeName.exe"
+$exe = Join-Path $Target "F1LiveTelemetry.exe"
 try {
-    Log "Waiting for process $ProcId to exit"
-    try { Wait-Process -Id $ProcId -Timeout 120 -ErrorAction Stop } catch { }
-    # esperar tambien a otras instancias (visualizador + capturador)
-    $deadline = (Get-Date).AddMinutes(10)
-    $running = @()
-    while ((Get-Date) -lt $deadline) {
-        $running = @(Get-Process -Name $exeName -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Path -eq $exe })
-        if ($running.Count -eq 0) { break }
-        Start-Sleep -Seconds 2
-    }
-    if ($running.Count -gt 0) {
-        Log "Aborted: the app is still running after 10 minutes"
-        exit 1
-    }
-
-    Log "Backing up current version"
-    $exeOld = "$exe.old"
-    $internal = Join-Path $Target "_internal"
-    $internalOld = "$internal.old"
-    if (Test-Path $exeOld) { Remove-Item $exeOld -Force }
-    if (Test-Path $internalOld) { Remove-Item $internalOld -Recurse -Force }
-    Retry { Move-Item $exe $exeOld -Force }
-    Retry { if (Test-Path $internal) { Move-Item $internal $internalOld -Force } }
-
-    try {
-        Log "Copying new version from $Source"
-        Copy-Item (Join-Path $Source "*") $Target -Recurse -Force
-        Log "Update applied"
-    } catch {
-        Log "Copy failed: $_ -- rolling back"
-        if (Test-Path $exe) { Remove-Item $exe -Force }
-        if (Test-Path $internal) { Remove-Item $internal -Recurse -Force }
-        Move-Item $exeOld $exe -Force
-        if (Test-Path $internalOld) { Move-Item $internalOld $internal -Force }
-        throw
-    }
-
-    try { Remove-Item $exeOld -Force } catch { }
-    try { Remove-Item $internalOld -Recurse -Force } catch { }
-    try { Remove-Item $Source -Recurse -Force } catch { }
-
-    Log "Restarting: $exe $RestartArgs"
-    try {
-        if ($RestartArgs) {
-            Start-Process -FilePath $exe -ArgumentList $RestartArgs -WorkingDirectory $Target
-        } else {
-            Start-Process -FilePath $exe -WorkingDirectory $Target
+    if ($DoMain -eq "1") {
+        Log "Waiting for process $ProcId to exit"
+        try { Wait-Process -Id $ProcId -Timeout 120 -ErrorAction Stop } catch { }
+        # esperar solo al visualizador; el capturador es un exe aparte con su
+        # propio _internal y puede seguir grabando
+        $deadline = (Get-Date).AddMinutes(10)
+        $running = @()
+        while ((Get-Date) -lt $deadline) {
+            $running = @(Get-Process -Name "F1LiveTelemetry" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Path -eq $exe })
+            if ($running.Count -eq 0) { break }
+            Start-Sleep -Seconds 2
         }
-    } catch {
-        Log "Restart failed: $_"
+        if ($running.Count -gt 0) {
+            Log "Aborted: the app is still running after 10 minutes"
+            exit 1
+        }
+
+        Log "Backing up current version"
+        $exeOld = "$exe.old"
+        $internal = Join-Path $Target "_internal"
+        $internalOld = "$internal.old"
+        if (Test-Path $exeOld) { Remove-Item $exeOld -Force }
+        if (Test-Path $internalOld) { Remove-Item $internalOld -Recurse -Force }
+        Retry { Move-Item $exe $exeOld -Force }
+        Retry { if (Test-Path $internal) { Move-Item $internal $internalOld -Force } }
+
+        try {
+            Log "Copying new main app from $Source"
+            # todo menos la subcarpeta capture\ (fase propia mas abajo)
+            Get-ChildItem -LiteralPath $Source -Force | Where-Object { $_.Name -ne "capture" } |
+                ForEach-Object { Copy-Item $_.FullName $Target -Recurse -Force }
+            Log "Main app updated"
+        } catch {
+            Log "Copy failed: $_ -- rolling back"
+            if (Test-Path $exe) { Remove-Item $exe -Force }
+            if (Test-Path $internal) { Remove-Item $internal -Recurse -Force }
+            Move-Item $exeOld $exe -Force
+            if (Test-Path $internalOld) { Move-Item $internalOld $internal -Force }
+            throw
+        }
+        try { Remove-Item $exeOld -Force } catch { }
+        try { Remove-Item $internalOld -Recurse -Force } catch { }
+
+        Log "Restarting: $exe $RestartArgs"
+        try {
+            if ($RestartArgs) {
+                Start-Process -FilePath $exe -ArgumentList $RestartArgs -WorkingDirectory $Target
+            } else {
+                Start-Process -FilePath $exe -WorkingDirectory $Target
+            }
+        } catch {
+            Log "Restart failed: $_"
+        }
     }
+
+    if ($DoCapture -eq "1") {
+        $capSrc = Join-Path $Source "capture"
+        $capDst = Join-Path $Target "capture"
+        if (Test-Path $capSrc) {
+            $capExe = Join-Path $capDst "F1TelemCapture.exe"
+            # una captura en curso nunca se interrumpe: esperar (hasta 60 min)
+            # a que el capturador se cierre para reemplazarlo
+            $deadline = (Get-Date).AddMinutes(60)
+            $capRun = @()
+            while ((Get-Date) -lt $deadline) {
+                $capRun = @(Get-Process -Name "F1TelemCapture" -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Path -eq $capExe })
+                if ($capRun.Count -eq 0) { break }
+                Start-Sleep -Seconds 5
+            }
+            if ($capRun.Count -gt 0) {
+                Log "Capturer still running after 60 min: skipped (next update will retry)"
+            } else {
+                try {
+                    if (-not (Test-Path $capDst)) { New-Item -ItemType Directory -Path $capDst | Out-Null }
+                    $capOld = Join-Path $capDst "_internal.old"
+                    if (Test-Path $capOld) { Remove-Item $capOld -Recurse -Force }
+                    $capInt = Join-Path $capDst "_internal"
+                    if (Test-Path $capInt) { Retry { Move-Item $capInt $capOld -Force } }
+                    if (Test-Path $capExe) {
+                        Retry { Move-Item $capExe "$capExe.old" -Force }
+                    }
+                    Copy-Item (Join-Path $capSrc "*") $capDst -Recurse -Force
+                    try { Remove-Item "$capExe.old" -Force } catch { }
+                    try { Remove-Item $capOld -Recurse -Force } catch { }
+                    Log "Capturer updated"
+                } catch {
+                    Log "Capturer update failed: $_"
+                }
+            }
+        }
+    }
+
+    try { Remove-Item $Source -Recurse -Force } catch { }
 } catch {
     Log "Update failed: $_"
     exit 1
@@ -275,8 +325,11 @@ def _powershell() -> str:
     return str(exe) if exe.exists() else "powershell.exe"
 
 
-def launch_installer(payload: Path, restart_args: list[str]) -> None:
-    """Lanza `apply_update.ps1` desatendido; la app debe cerrarse después."""
+def launch_installer(payload: Path, restart_args: list[str],
+                     do_main: bool = True, do_capture: bool = True) -> None:
+    """Lanza `apply_update.ps1` desatendido. Con do_main la app debe cerrarse
+    después (el instalador la espera y la relanza); con solo do_capture la app
+    sigue abierta y el capturador se reemplaza cuando se cierre."""
     target = install_dir()
     if target is None:
         raise RuntimeError("Auto-install only works from the packaged build.")
@@ -290,6 +343,8 @@ def launch_installer(payload: Path, restart_args: list[str]) -> None:
         "-Source", str(payload),
         "-Target", str(target),
         "-LogPath", str(staging / "update.log"),
+        "-DoMain", "1" if do_main else "0",
+        "-DoCapture", "1" if do_capture else "0",
     ]
     if restart_args:
         cmd += ["-RestartArgs", " ".join(restart_args)]

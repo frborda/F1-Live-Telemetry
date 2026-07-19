@@ -125,6 +125,14 @@ class TimingAnalyzer:
         t = buf.col("t")[i0:i1].astype(np.float64)
         completed = lap < buf.current_lap()
 
+        # conexión a mitad de sesión (vivo): la primera vuelta observada no
+        # arranca en la meta — su marco está corrido por el punto de entrada
+        # y cronometrarla ensuciaría Last/Best con una vuelta parcial
+        if i0 == 0 and self.hub.live_frames:
+            off = self.hub.provisional_start_offset(drv)
+            if off is None or abs(off) > 150.0:
+                return None
+
         # marco propio de la vuelta: las muestras vecinas se proyectan vía
         # dist_total (comparte la integración con dist_lap) y, si la vuelta
         # siguiente ya existe, las marcas se escalan al largo REALMENTE
@@ -342,11 +350,13 @@ class TimingAnalyzer:
         if buf is None or buf.n < 2:
             return None
         L = self.hub.track_length
-        # vuelta 1 en curso: offset de grilla estimado por proyección sobre
-        # el trazado (cuando cierra la vuelta 1 lo reemplaza el exacto)
+        # primer tramo observado sin cruce de meta (vuelta 1 en curso o
+        # conexión a mitad de sesión): offset estimado por proyección sobre
+        # el trazado (cuando llega el primer cruce lo reemplaza el exacto)
         cur_off = 0.0
-        if int(buf.col("lap")[-1]) == 1:
-            provisional = self.hub.provisional_lap1_offset(drv)
+        lap_all = buf.col("lap")
+        if int(lap_all[-1]) == int(lap_all[0]):
+            provisional = self.hub.provisional_start_offset(drv)
             if provisional is not None:
                 cur_off = provisional
         cached = self._pos_cache.get(drv)
@@ -377,14 +387,16 @@ class TimingAnalyzer:
         return result
 
     def real_positions_ready(self, drv: str) -> bool:
-        """True cuando la posición de pista del piloto es real: vuelta 1
-        cerrada, o vuelta 1 en curso con offset de grilla ya estimado."""
+        """True cuando la posición de pista del piloto es real: ya se observó
+        un cruce de meta en los datos (ancla exacta), o hay offset provisional
+        proyectado (vuelta 1 en la grilla o conexión a mitad de sesión)."""
         buf = self.hub.buffers.get(drv)
         if buf is None or not buf.n:
             return False
-        if buf.current_lap() >= 2:
+        lapcol = buf.col("lap")
+        if int(lapcol[-1]) > int(lapcol[0]):
             return True
-        return self.hub.provisional_lap1_offset(drv) is not None
+        return self.hub.provisional_start_offset(drv) is not None
 
     @staticmethod
     def _decimate(p: np.ndarray, t: np.ndarray, cap: int = 12000):

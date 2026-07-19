@@ -33,19 +33,37 @@ FEEDS = [
     "CarData.z",
     "Position.z",
     "TimingData",
+    "TimingAppData",
     "DriverList",
     "SessionInfo",
     "TrackStatus",
     "WeatherData",
     "LapCount",
+    "RaceControlMessages",
+    "ExtrapolatedClock",
 ]
 _UTC_RE = re.compile(r"(\.\d{1,6})\d*")
 
 
 def _parse_utc(text: str) -> float:
-    """'2026-07-05T14:02:03.1234567Z' -> epoch en segundos."""
+    """'2026-07-05T14:02:03.1234567Z' -> epoch en segundos. Los stamps sin
+    zona (RaceControlMessages) también son UTC."""
     text = _UTC_RE.sub(r"\1", text.replace("Z", "+00:00"))
-    return dt.datetime.fromisoformat(text).timestamp()
+    parsed = dt.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def _parse_clock(text) -> float | None:
+    """'1:23:45' / '23:45' -> segundos (None si no parsea)."""
+    try:
+        secs = 0.0
+        for part in str(text).split(":"):
+            secs = secs * 60.0 + float(part)
+        return secs
+    except (ValueError, TypeError):
+        return None
 
 
 def decompress_feed(data: str) -> dict:
@@ -129,6 +147,17 @@ class LiveDecoderMixin:
         self._weather_log: list[tuple] = []
         self._sector_sent: set[tuple[str, int, int]] = set()
         self._segment_state: dict[tuple[str, int, int], int] = {}
+        # dirección de carrera, stints, reloj y paradas
+        self._rcm: dict[int, dict] = {}
+        self._stints: dict[str, dict[int, dict]] = {}
+        self._tyres: dict[str, dict[int, tuple[str, int]]] = {}
+        self._clock: list | None = None
+        self._lap_count = [0, 0]
+        self._pit_counts: dict[str, int] = {}
+        self._pit_log: dict[str, list] = {}
+        # visitas a la calle de boxes: transiciones de InPit
+        self._inpit: dict[str, bool] = {}
+        self._pit_visits: dict[str, list] = {}  # {num: [[vuelta, t_in, t_out|None]]}
         # el snapshot inicial trae valores de la vuelta ANTERIOR: no sirven
         # para atribuir tiempos a la vuelta en curso (los Segments sí)
         self._in_snapshot = False
@@ -175,6 +204,14 @@ class LiveDecoderMixin:
             self._on_track_status(data)
         elif name == "WeatherData":
             self._on_weather(data)
+        elif name == "RaceControlMessages":
+            self._on_race_control(data)
+        elif name == "TimingAppData":
+            self._on_timing_app(data)
+        elif name == "ExtrapolatedClock":
+            self._on_clock(data)
+        elif name == "LapCount":
+            self._on_lap_count(data)
 
     def _on_track_status(self, data) -> None:
         """Banderas/SC: cierra el período abierto y abre uno nuevo si aplica."""
@@ -209,6 +246,111 @@ class LiveDecoderMixin:
         self._weather_log.append(entry)
         self.weather.emit(list(self._weather_log))
 
+    def _on_race_control(self, data) -> None:
+        """Mensajes de dirección de carrera: banderas, SC/VSC, sanciones.
+        El snapshot trae la lista completa; los diffs llegan como
+        {"Messages": {"41": {...}}} — el índice deduplica."""
+        if not isinstance(data, dict):
+            return
+        changed = False
+        for idx, msg in _index_items(data.get("Messages")):
+            if not isinstance(msg, dict) or not msg.get("Message"):
+                continue
+            utc = None
+            try:
+                utc = _parse_utc(str(msg["Utc"]))
+            except (KeyError, ValueError):
+                pass
+            lap = msg.get("Lap")
+            self._rcm[idx] = {
+                "utc": utc,
+                "t": self._last_rel_t,
+                "lap": int(lap) if isinstance(lap, int) else None,
+                "category": str(msg.get("Category") or ""),
+                "flag": str(msg.get("Flag") or ""),
+                "scope": str(msg.get("Scope") or ""),
+                "sector": msg.get("Sector"),
+                "mode": str(msg.get("Mode") or ""),
+                "driver": str(msg.get("RacingNumber") or ""),
+                "message": str(msg.get("Message") or ""),
+            }
+            changed = True
+        if changed:
+            self._emit_race_control()
+
+    def _emit_race_control(self) -> None:
+        """El t relativo sale del stamp UTC del mensaje cuando el ancla de
+        tiempo (_t0) ya existe; los emitidos antes se recalculan acá."""
+        rows = []
+        for key in sorted(self._rcm):
+            row = dict(self._rcm[key])
+            utc = row.pop("utc", None)
+            if utc is not None and self._t0 is not None:
+                row["t"] = utc - self._t0
+            rows.append(row)
+        self.raceControl.emit(rows)
+
+    def _on_timing_app(self, data) -> None:
+        """Stints de neumáticos: se acumulan los diffs por índice y se
+        reconstruye el mapa por vuelta {vuelta: (compuesto, edad)} con el
+        mismo contrato que emite el replay."""
+        if not isinstance(data, dict):
+            return
+        changed = set()
+        for num, line in (data.get("Lines") or {}).items():
+            if not isinstance(line, dict):
+                continue
+            for idx, st in _index_items(line.get("Stints")):
+                if isinstance(st, dict):
+                    self._stints.setdefault(num, {}).setdefault(idx, {}).update(st)
+                    changed.add(num)
+        if not changed:
+            return
+        for num in changed:
+            self._rebuild_tyres(num)
+        if self._tyres:
+            self.tyres.emit({d: dict(m) for d, m in self._tyres.items()})
+
+    def _rebuild_tyres(self, num: str) -> None:
+        laps: dict[int, tuple[str, int]] = {}
+        lap0 = 1
+        for idx in sorted(self._stints.get(num, {})):
+            st = self._stints[num][idx]
+            compound = str(st.get("Compound") or "")
+            try:
+                total = int(st.get("TotalLaps") or 0)
+                start = int(st.get("StartLaps") or 0)
+            except (TypeError, ValueError):
+                total = start = 0
+            run = max(total - start, 1)  # vueltas corridas en este stint
+            for j in range(run):
+                laps[lap0 + j] = (compound, start + j + 1)
+            lap0 += run
+        if laps:
+            self._tyres[num] = laps
+
+    def _on_clock(self, data) -> None:
+        if not isinstance(data, dict):
+            return
+        remaining = _parse_clock(data.get("Remaining"))
+        if remaining is not None:
+            extrap = bool(data.get(
+                "Extrapolating", self._clock[2] if self._clock else False))
+            self._clock = [self._last_rel_t, remaining, extrap]
+        elif self._clock is not None and "Extrapolating" in data:
+            self._clock[2] = bool(data.get("Extrapolating"))
+        if self._clock is not None:
+            self.sessionClock.emit(tuple(self._clock))
+
+    def _on_lap_count(self, data) -> None:
+        if not isinstance(data, dict):
+            return
+        if isinstance(data.get("CurrentLap"), int):
+            self._lap_count[0] = data["CurrentLap"]
+        if isinstance(data.get("TotalLaps"), int):
+            self._lap_count[1] = data["TotalLaps"]
+        self.lapCount.emit(tuple(self._lap_count))
+
     def _on_session_info(self, data) -> None:
         if not isinstance(data, dict):
             return
@@ -216,6 +358,9 @@ class LiveDecoderMixin:
         name = data.get("Name", "")
         if meeting or name:
             self.statusChanged.emit(f"Live: {meeting} — {name}")
+        stype = str(data.get("Type") or "")
+        if meeting or name or stype:
+            self.sessionMeta.emit({"type": stype, "meeting": meeting, "name": name})
         # trazado completo inmediato: la API de circuitos de MultiViewer usa
         # las mismas coordenadas que Position.z. Sin esto, el mapa se
         # autoconstruía recién cuando un auto cerraba ~2 vueltas (minutos), y
@@ -286,12 +431,39 @@ class LiveDecoderMixin:
             return
         sector_reports: list[tuple] = []
         seg_updates: list[tuple] = []
+        pits_changed = False
+        lane_changed = False
         for num, line in (data.get("Lines") or {}).items():
             if not isinstance(line, dict):
                 continue
             if isinstance(line.get("NumberOfLaps"), int):
                 self._laps_done[num] = line["NumberOfLaps"]
             done = self._laps_done.get(num, 0)
+            # paradas: los incrementos del contador oficial marcan la parada
+            # (el snapshot solo fija la línea base, sin instante conocido)
+            n_stops = line.get("NumberOfPitStops")
+            if isinstance(n_stops, int):
+                prev = self._pit_counts.get(num)
+                self._pit_counts[num] = n_stops
+                if prev is not None and n_stops > prev and not self._in_snapshot:
+                    self._pit_log.setdefault(num, []).append(
+                        (done + 1, self._last_rel_t))
+                    pits_changed = True
+            # visitas a la calle de boxes: entrada/salida por InPit (en el
+            # snapshot, un auto ya adentro abre su visita en ese instante)
+            inpit = line.get("InPit")
+            if isinstance(inpit, bool):
+                was = self._inpit.get(num)
+                self._inpit[num] = inpit
+                if inpit and was is not True:
+                    self._pit_visits.setdefault(num, []).append(
+                        [done + 1, self._last_rel_t, None])
+                    lane_changed = True
+                elif not inpit and was is True:
+                    visits = self._pit_visits.get(num)
+                    if visits and visits[-1][2] is None:
+                        visits[-1][2] = self._last_rel_t
+                        lane_changed = True
             # tiempo oficial de la vuelta recién cerrada (formato "1:44.361")
             if not self._in_snapshot:
                 last = line.get("LastLapTime")
@@ -322,6 +494,11 @@ class LiveDecoderMixin:
             self.sectorTimes.emit(sector_reports)
         if seg_updates:
             self.segmentStatus.emit(seg_updates)
+        if pits_changed:
+            self.pits.emit({k: list(v) for k, v in self._pit_log.items()})
+        if lane_changed:
+            self.pitLane.emit({k: [list(v) for v in vs]
+                               for k, vs in self._pit_visits.items()})
 
     def _on_position(self, data) -> None:
         if not isinstance(data, dict):

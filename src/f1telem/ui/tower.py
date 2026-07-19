@@ -45,6 +45,7 @@ class TowerRow:
     code: str
     color: str
     pos: int
+    ready: bool                # posición de pista confiable (ancla o proyección)
     delta: int | None          # posiciones ganadas (+) desde el inicio
     gear: int
     rpm: float
@@ -62,6 +63,12 @@ class TowerRow:
     avg5: float = float("nan")
     avg10: float = float("nan")
     catch: float | None = None  # vueltas para alcanzar al de adelante
+    tyre: str = ""              # compuesto actual (SOFT/MEDIUM/...)
+    tyre_age: int = 0           # vueltas del juego actual
+    pit_lap: int = 0            # vuelta de la última pasada por boxes
+    pit_lane_s: float = float("nan")  # segundos en la calle en esa pasada
+    pit_stop_s: float = float("nan")  # segundos detenido en esa pasada
+    pit_open: bool = False      # está en la calle ahora mismo
 
 
 def _text_on(bg: QColor) -> QColor:
@@ -311,7 +318,12 @@ class TimingTower(QWidget):
             self.rows = []
             self.canvas.update()
             return
-        if not self._order0:
+        # sin ancla de meta ni proyección la posición no es real (conexión a
+        # mitad de sesión): esos autos van al fondo con posición "–"
+        ready_set = {d for d in ordered if an.real_positions_ready(d)}
+        ordered = ([d for d in ordered if d in ready_set]
+                   + [d for d in ordered if d not in ready_set])
+        if not self._order0 and len(ready_set) == len(ordered):
             self._order0 = {drv: i + 1 for i, drv in enumerate(ordered)}
         L = self.hub.track_length
         leader = ordered[0]
@@ -334,8 +346,7 @@ class TimingTower(QWidget):
             cur_lap = buf.current_lap()
             pos_now = float(pts[drv][0][-1])
             t_now = float(pts[drv][1][-1])
-            ready = (an.real_positions_ready(drv)
-                     and an.real_positions_ready(leader)
+            ready = (drv in ready_set and leader in ready_set
                      and pos_now >= L / 3.0)
             catch = None
             if i == 0:
@@ -388,13 +399,41 @@ class TimingTower(QWidget):
                     )
                     sectors.append((val, kind, dim))
 
+            # neumático actual: la entrada de la vuelta en curso, o la última
+            # conocida extendida (el mapa por vuelta puede venir con retraso)
+            tyre, tyre_age = "", 0
+            tyre_map = self.hub.tyres.get(drv)
+            if tyre_map:
+                lap_key = cur_lap if cur_lap in tyre_map else max(tyre_map)
+                tyre, tyre_age = tyre_map[lap_key]
+                if cur_lap > lap_key:
+                    tyre_age += cur_lap - lap_key
+
+            # última pasada por boxes: vuelta, tiempo en calle y detenido
+            pit_lap, pit_lane_s, pit_stop_s = 0, float("nan"), float("nan")
+            pit_open = False
+            visit = self.hub.last_pit_visit(drv)
+            if visit is not None:
+                v_lap, t_in, t_out = visit
+                pit_lap = int(v_lap)
+                pit_open = t_out is None
+                end = self.hub.latest_t if pit_open else float(t_out)
+                pit_lane_s = max(0.0, end - float(t_in))
+                pit_stop_s = self.hub.pit_stationary_time(drv, float(t_in), end)
+            else:
+                stops = self.hub.pits.get(drv)
+                if stops:
+                    pit_lap = int(stops[-1][0])
+
             base0 = self._order0.get(drv)
+            row_ready = drv in ready_set
             rows.append(TowerRow(
                 drv=drv,
                 code=info.code if info else drv,
                 color=info.color if info else "#9aa0a6",
                 pos=i + 1,
-                delta=(base0 - (i + 1)) if base0 is not None else None,
+                ready=row_ready,
+                delta=(base0 - (i + 1)) if base0 is not None and row_ready else None,
                 gear=int(buf.col("gear")[-1]),
                 rpm=float(buf.col("rpm")[-1]),
                 speed=float(buf.col("speed")[-1]),
@@ -412,6 +451,12 @@ class TimingTower(QWidget):
                 avg5=self._avg_lap(drv, 5),
                 avg10=self._avg_lap(drv, 10),
                 catch=catch,
+                tyre=tyre,
+                tyre_age=tyre_age,
+                pit_lap=pit_lap,
+                pit_lane_s=pit_lane_s,
+                pit_stop_s=pit_stop_s,
+                pit_open=pit_open,
             ))
         self.rows = rows
         self.canvas.setMinimumHeight(len(rows) * self.row_h)
@@ -421,6 +466,16 @@ class TimingTower(QWidget):
         parts = [f"{row.code} — P{row.pos}",
                  f"Pits: {row.pits}",
                  f"AVG5: {fmt_laptime(row.avg5)} · AVG10: {fmt_laptime(row.avg10)}"]
+        if row.tyre:
+            parts.insert(1, f"Tyre: {row.tyre.title()} · {row.tyre_age} laps")
+        if row.pit_lap:
+            lane = (f"{row.pit_lane_s:.1f}s"
+                    if row.pit_lane_s == row.pit_lane_s else "—")
+            stop = (f"{row.pit_stop_s:.1f}s"
+                    if row.pit_stop_s == row.pit_stop_s else "—")
+            parts.append(
+                f"In pit lane NOW — {lane} (stopped {stop})" if row.pit_open
+                else f"Last pit: L{row.pit_lap} · lane {lane} · stopped {stop}")
         if row.catch is not None:
             parts.append(f"Catching the car ahead in ~{row.catch:.1f} laps")
         return "\n".join(parts)
@@ -445,14 +500,15 @@ class TimingTower(QWidget):
             line_h = row_h // 2 - 4 * s
             x = 4 * s
 
-            # caja de posición y sigla en color de equipo
+            # caja de posición y sigla en color de equipo ("–" si la posición
+            # aún no es confiable: conexión a mitad de sesión)
             p.setPen(Qt.NoPen)
             p.setBrush(team)
             p.drawRoundedRect(QRectF(x, y + 4 * s, 22 * s, row_h - 8 * s), 3, 3)
             p.setPen(on_team)
             p.setFont(f_big)
             p.drawText(QRectF(x, y + 4 * s, 22 * s, row_h - 8 * s),
-                       Qt.AlignCenter, str(row.pos))
+                       Qt.AlignCenter, str(row.pos) if row.ready else "–")
             x += 24 * s
             p.setPen(Qt.NoPen)
             p.setBrush(team)
@@ -463,10 +519,28 @@ class TimingTower(QWidget):
                        Qt.AlignCenter, row.code)
             x += 44 * s
 
-            # Δ posición (arriba) y DRS (abajo)
-            if width >= 250 * s:
+            # neumático actual: letra del compuesto (arriba) y edad (abajo)
+            if row.tyre:
+                tc = QColor(theme.COMPOUND_COLORS.get(row.tyre.upper(), "#9aa0a6"))
+                d = min(13.0 * s, line_h)
+                circle = QRectF(x + (18 * s - d) / 2, top + (line_h - d) / 2 + 1, d, d)
+                p.setPen(Qt.NoPen)
+                p.setBrush(tc)
+                p.drawEllipse(circle)
+                p.setPen(_text_on(tc))
                 p.setFont(f_small)
-                if row.delta is None or row.delta == 0:
+                p.drawText(circle, Qt.AlignCenter, row.tyre[0])
+                p.setPen(QColor(theme.TEXT_MUTED))
+                p.drawText(QRectF(x, bot, 18 * s, line_h), Qt.AlignCenter,
+                           str(row.tyre_age))
+            x += 20 * s
+
+            # Δ posición (arriba) y DRS (abajo)
+            if width >= 270 * s:
+                p.setFont(f_small)
+                if row.delta is None:
+                    d_txt = ""
+                elif row.delta == 0:
                     p.setPen(QColor(theme.TEXT_MUTED))
                     d_txt = "−0"
                 elif row.delta > 0:
@@ -485,7 +559,7 @@ class TimingTower(QWidget):
                 x += 30 * s
 
             # marcha + rpm, velocidad
-            if width >= 310 * s:
+            if width >= 330 * s:
                 p.setPen(QColor(theme.ACCENT))
                 p.setFont(f_big)
                 p.drawText(QRectF(x, top, 22 * s, line_h + 2), Qt.AlignCenter,
@@ -537,7 +611,7 @@ class TimingTower(QWidget):
             x += 54 * s
 
             # promedios de las últimas 5/10 vueltas (sin vueltas de boxes)
-            if width >= 380 * s:
+            if width >= 400 * s:
                 p.setFont(f_small)
                 for label, value, y_avg in (("A5", row.avg5, top),
                                             ("A10", row.avg10, bot)):
@@ -548,6 +622,29 @@ class TimingTower(QWidget):
                     p.drawText(QRectF(x + 20 * s, y_avg, 44 * s, line_h),
                                Qt.AlignVCenter | Qt.AlignLeft, fmt_laptime(value))
                 x += 68 * s
+
+            # última pasada por boxes: vuelta + tiempo en calle (arriba) y
+            # tiempo detenido (abajo); la calle en amarillo si está adentro
+            if width >= 470 * s:
+                if row.pit_lap:
+                    p.setFont(f_small)
+                    p.setPen(QColor(theme.TEXT_MUTED))
+                    p.drawText(QRectF(x, top, 22 * s, line_h),
+                               Qt.AlignVCenter | Qt.AlignLeft, f"L{row.pit_lap}")
+                    p.setPen(QColor("#d6be3c") if row.pit_open else QColor(theme.TEXT))
+                    lane_txt = (f"{row.pit_lane_s:.1f}s"
+                                if row.pit_lane_s == row.pit_lane_s else "—")
+                    p.drawText(QRectF(x + 22 * s, top, 42 * s, line_h),
+                               Qt.AlignVCenter | Qt.AlignLeft, lane_txt)
+                    p.setPen(QColor(theme.TEXT_MUTED))
+                    p.drawText(QRectF(x, bot, 22 * s, line_h),
+                               Qt.AlignVCenter | Qt.AlignLeft, "stp")
+                    p.setPen(QColor(theme.TEXT))
+                    stop_txt = (f"{row.pit_stop_s:.1f}s"
+                                if row.pit_stop_s == row.pit_stop_s else "—")
+                    p.drawText(QRectF(x + 22 * s, bot, 42 * s, line_h),
+                               Qt.AlignVCenter | Qt.AlignLeft, stop_txt)
+                x += 66 * s
 
             # microsectores (rayitas) + tiempos de sector debajo
             if width - x >= 96 * s and row.segs:

@@ -16,6 +16,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("F1TELEM_NO_UPDATE_CHECK", "1")  # sin red hacia GitHub
+os.environ.setdefault("F1TELEM_DEV_SOURCES", "1")      # fuente demo en el combo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 # la consola Windows (cp1252) no soporta Δ, →, −: degradar en vez de crashear
 sys.stdout.reconfigure(errors="replace")
@@ -146,8 +147,8 @@ def test_gap_grid_offset() -> None:
     hub_l1.on_batch(batch)
     hub_l1.on_positions(posb)
     an_l1 = TimingAnalyzer(hub_l1)
-    check(abs((hub_l1.provisional_lap1_offset("B") or -1) - 200.0) < 25.0,
-          f"offset de grilla estimado por proyección ({hub_l1.provisional_lap1_offset('B')})")
+    check(abs((hub_l1.provisional_start_offset("B") or -1) - 200.0) < 25.0,
+          f"offset de grilla estimado por proyección ({hub_l1.provisional_start_offset('B')})")
     g_l1 = an_l1.gap_series("B", "A")
     check(g_l1 is not None, "gap disponible DURANTE la vuelta 1 (tras el S1)")
     check(float(g_l1[0][0]) >= DL / 3.0 - 30.0,
@@ -297,10 +298,12 @@ def test_catch_projection() -> None:
 
 def test_app_demo(app: QApplication) -> None:
     win = MainWindow()
+    # sin popups durante el smoke: el log del gestor alcanza para verificar
+    win.cfg.setdefault("notifications", {})["popups"] = False
     win.show()
 
     # conectar fuente demo a x25
-    win.source_combo.setCurrentIndex(0)
+    win.source_combo.setCurrentIndex(win.source_combo.findData("demo"))
     win.speed_combo.setCurrentIndex(4)  # x25
     win.connect_btn.click()
     pump(app, 3.0)
@@ -829,9 +832,14 @@ def test_app_demo(app: QApplication) -> None:
     expected = win.hub.track_length * 2.0 * (1 + win.chart_rolling.RIGHT_MARGIN_FRAC)
     check(abs((xr[1] - xr[0]) - expected) < win.hub.track_length * 0.05,
           f"Carrera: ventana de 2 vueltas aplicada ({xr[1] - xr[0]:.0f} m)")
+    xy2 = win.chart_rolling._xy.get(first)
+    check(xy2 is not None and float(xy2[0][-1] - xy2[0][0]) >= win.hub.track_length * 2.0,
+          f"Carrera: datos cubren la ventana ampliada "
+          f"({0 if xy2 is None else float(xy2[0][-1] - xy2[0][0]):.0f} m)")
     cx2, _cy2 = win.chart_rolling.curves[first].getData()
-    check(float(cx2[-1] - cx2[0]) >= win.hub.track_length * 2.0,
-          f"Carrera: datos cubren la ventana ampliada ({float(cx2[-1] - cx2[0]):.0f} m)")
+    check(float(cx2[-1] - cx2[0]) >= win.hub.track_length * 2.0 * 0.93,
+          f"Carrera: dibujado cubre la ventana menos el retardo de reproducción "
+          f"({float(cx2[-1] - cx2[0]):.0f} m)")
     win.window_combo.setCurrentIndex(win.window_combo.findData(0.0))
     pump(app, 1.0)
     xr = win.chart_rolling.getViewBox().viewRange()[0]
@@ -902,6 +910,153 @@ def test_app_demo(app: QApplication) -> None:
     check(deg_txt == "—" or deg_txt[0] in "+-",
           f"stints: pendiente de degradación ({deg_txt})")
 
+    # paneles de contexto: tira de sesión, race control, estrategia y clima
+    win.session_strip.refresh()
+    check(win.session_strip.session_label.text() == "Demo Grand Prix — Race",
+          f"tira de sesión: nombre ({win.session_strip.session_label.text()})")
+    lap_txt = win.session_strip.lap_label.text()
+    check(lap_txt.startswith("LAP ") and lap_txt.endswith("/20"),
+          f"tira de sesión: vuelta actual/total ({lap_txt})")
+    check(win.session_strip.clock_label.text().startswith("⏱"),
+          f"tira de sesión: reloj ({win.session_strip.clock_label.text()})")
+    check(win.session_strip.flag_label.isVisible(),
+          "tira de sesión: badge de bandera visible")
+    check("SAFETY CAR" in win.session_strip.rcm_label.text(),
+          f"tira de sesión: último mensaje RCM ({win.session_strip.rcm_label.text()})")
+
+    for pid in ("strategy", "race_control", "weather", "weather_chart"):
+        win._panels[pid].set_panel_visible(True)
+    pump(app, 0.2)
+    win.race_control_view.refresh()
+    check(win.race_control_view.list.count() == 5,
+          f"race control: mensajes listados ({win.race_control_view.list.count()})")
+
+    win.strategy_view.refresh()
+    check(len(win.strategy_view.rows) == 6,
+          f"estrategia: una fila por auto ({len(win.strategy_view.rows)})")
+    stints0 = win.strategy_view.rows[0][3]
+    check(stints0[0] == ("SOFT", 1, 4) and stints0[1][0] == "MEDIUM",
+          f"estrategia: stints SOFT 1-4 y MEDIUM ({stints0[:2]})")
+
+    win.weather_now.refresh()
+    check(win.weather_now._values["air"].text().endswith("°"),
+          f"clima: temperatura de aire ({win.weather_now._values['air'].text()})")
+    win.weather_chart.refresh()
+    wx = win.weather_chart.c_air.getData()[0]
+    lead_lap = max(b.current_lap() for b in win.hub.buffers.values() if b.n)
+    check(wx is not None and len(wx) == 3 and wx[-1] <= lead_lap + 1
+          and all(np.diff(wx) >= 0),
+          f"clima: eje X en vueltas del líder ({None if wx is None else [round(float(v), 2) for v in wx]})")
+    check(len(win.weather_chart._rain_items) == 1,
+          f"clima: banda de lluvia ({len(win.weather_chart._rain_items)})")
+
+    win.tower.refresh()
+    tyres_shown = {r.tyre for r in win.tower.rows}
+    check(tyres_shown == {"MEDIUM"} and all(r.tyre_age > 0 for r in win.tower.rows),
+          f"torre: compuesto y edad actuales ({tyres_shown})")
+
+    # pit lane: última pasada en la torre y panel con relojes corriendo
+    row0 = win.tower.rows[0]
+    check(row0.pit_lap == 4 and abs(row0.pit_lane_s - 21.0) < 0.6
+          and row0.pit_stop_s == row0.pit_stop_s and row0.pit_stop_s < 0.5
+          and not row0.pit_open,
+          f"torre: última pasada por boxes (L{row0.pit_lap}, "
+          f"{row0.pit_lane_s:.1f}s en calle, {row0.pit_stop_s:.1f}s detenido)")
+    win._panels["pitlane"].set_panel_visible(True)
+    pump(app, 0.2)
+    win.pitlane_view.refresh()
+    check(len(win.pitlane_view.rows) == 0,
+          "pit lane: vacío con todas las visitas cerradas")
+    win.hub.pit_lane.setdefault(first, []).append(
+        [9, win.hub.latest_t - 15.0, None])
+    win.pitlane_view.refresh()
+    win.tower.refresh()
+    check(len(win.pitlane_view.rows) == 1, "pit lane: piloto adentro listado")
+    _code, _color, compound, lane_s, _stop_s = win.pitlane_view.rows[0]
+    check(compound == "MEDIUM" and lane_s >= 14.5,
+          f"pit lane: compuesto de entrada y reloj corriendo ({compound}, {lane_s:.1f}s)")
+    row_f = next(r for r in win.tower.rows if r.drv == first)
+    check(row_f.pit_open and row_f.pit_lap == 9,
+          "torre: pasada abierta marcada (en calle ahora)")
+    win.hub.pit_lane[first].pop()
+    win.pitlane_view.refresh()
+
+    # gestor de notificaciones: los eventos del demo quedaron en el log
+    kinds_logged = {k for _s, k, _c, _t in win.notifier.log}
+    check({"pit_in", "pit_out", "yellow", "sc"} <= kinds_logged,
+          f"notificaciones: eventos del demo registrados ({sorted(kinds_logged)})")
+    win._panels["notifications"].set_panel_visible(True)
+    pump(app, 0.2)
+    win.notifications_view.refresh()
+    check(win.notifications_view.list.count() == len(win.notifier.log),
+          f"notificaciones: panel refleja el log ({win.notifications_view.list.count()})")
+
+    # race trace: gap por microsector contra referencia elegible
+    win.mode_combo.setCurrentIndex(4)
+    pump(app, 0.3)
+    tc = win.chart_trace
+    tc._dirty = True
+    tc.refresh()
+    sel = win._selected_drivers()
+    visible = [d for d, c in tc._curves.items() if c.isVisible()]
+    check(sorted(visible) == sorted(sel),
+          f"race trace: una curva por piloto seleccionado ({len(visible)})")
+    tx0, ty0 = tc._curves[sel[0]].getData()
+    step = tc._checkpoint_step()
+    check(tx0 is not None and len(tx0) > 50
+          and abs((tx0[1] - tx0[0]) * win.hub.track_length - step) < 1.0,
+          f"race trace: un punto por microsector ({0 if tx0 is None else len(tx0)} pts)")
+    check(len(tc._status_items) >= 1, "race trace: bandas de SC/bandera")
+    # tooltip de cursor: gap por piloto en el X del mouse (1 decimal)
+    tvb = tc.plot.getViewBox()
+    (tx0, tx1), (ty0, ty1) = tvb.viewRange()
+    x_mid = tx0 + (tx1 - tx0) * 0.6
+    tc._probe._on_move(tvb.mapViewToScene(QPointF(x_mid, (ty0 + ty1) / 2)))
+    check(len(tc._probe.rows) == len(sel),
+          f"race trace: tooltip con el gap de cada piloto ({len(tc._probe.rows)})")
+    gaps = [y for _lbl, y in tc._probe.rows]
+    check(gaps == sorted(gaps), "race trace: tooltip en orden de carrera")
+    check("+0.0 s" in tc._probe.label.toHtml() or "-0.0 s" in tc._probe.label.toHtml()
+          or f"{gaps[0]:+.1f} s" in tc._probe.label.toHtml(),
+          "race trace: gaps con 1 decimal en segundos")
+    tc._probe._hide()
+    idx_ref = tc.ref_combo.findData(sel[0])
+    tc.ref_combo.setCurrentIndex(idx_ref)
+    pump(app, 0.2)
+    _rx, ry = tc._curves[sel[0]].getData()
+    check(ry is not None and len(ry) and float(np.max(np.abs(ry))) < 1e-6,
+          "race trace: la referencia es su propia línea de cero")
+    tc.x_spin.setValue(2)
+    tc.y_spin.setValue(10.0)
+    pump(app, 0.2)
+    (xr0, xr1), (yr0, yr1) = tc.plot.getViewBox().viewRange()
+    check(abs((xr1 - xr0) - 2.0) < 0.25, f"race trace: rango X en vueltas ({xr1 - xr0:.2f})")
+    check(abs(yr0 + 10.0) < 0.5 and abs(yr1 - 10.0) < 0.5,
+          f"race trace: rango Y ±s ({yr0:.1f}..{yr1:.1f})")
+    tc.x_spin.setValue(0)
+    tc.y_spin.setValue(0.0)
+    tc.ref_combo.setCurrentIndex(0)
+    win.mode_combo.setCurrentIndex(0)
+    pump(app, 0.2)
+
+    # perfiles de layout: aplicar restaura visibilidad, flotantes y divisores
+    win._panels["map"].set_panel_visible(False)
+    win.cfg.setdefault("layouts", {})["smoke"] = {
+        "visible": {pid: True for pid in win._PERSIST_VISIBLE},
+        "float": {"tower": {"floating": True, "visible": True,
+                            "geom": [60, 60, 420, 520], "pinned": True}},
+        "win_max": False,
+    }
+    win._apply_layout_profile("smoke")
+    pump(app, 0.3)
+    check(win._panels["map"].is_panel_visible(), "perfil: visibilidad reaplicada")
+    check(win._panels["tower"].floating and win._panels["tower"].pinned,
+          "perfil: panel flotante y fijado restaurado")
+    win._panels["tower"].attach()
+    win._delete_layout_profile("smoke")
+    check("smoke" not in win.cfg.get("layouts", {}), "perfil: borrado")
+    pump(app, 0.2)
+
     # pausa y velocidad en caliente
     win.speed_combo.setCurrentIndex(win.speed_combo.findData(10.0))
     pump(app, 0.2)
@@ -922,13 +1077,70 @@ def test_app_demo(app: QApplication) -> None:
     pump(app, 0.5)
     check(win.source is None, "desconexión limpia")
 
-    # punta suavizada: sin muestras nuevas, la línea sigue creciendo con la
-    # velocidad aprendida (segmento de punta extrapolado)
+    # cursor de reproducción: sin muestras nuevas sigue barriendo lo recibido
+    # hasta consumirlo (la punta existe, o la curva ya llegó al último dato)
     pump(app, 0.4)
     tip_curve = win.chart_rolling._tips.get(first)
     tx, ty = tip_curve.getData() if tip_curve is not None else (None, None)
-    check(tx is not None and len(tx) == 2 and float(tx[1]) > float(tx[0]),
-          f"punta de serie extrapolada entre lotes ({'-' if tx is None else f'{float(tx[1] - tx[0]):.0f} m'})")
+    cx, _cy = win.chart_rolling.curves[first].getData()
+    xy_first = win.chart_rolling._xy.get(first)
+    consumed = (xy_first is not None and cx is not None
+                and len(cx) == len(xy_first[0]))
+    sweeping = tx is not None and len(tx) == 2 and float(tx[1]) > float(tx[0])
+    check(sweeping or consumed,
+          f"punta de reproducción barre o consumió todo ({'-' if tx is None or len(tx) < 2 else f'{float(tx[1] - tx[0]):.0f} m'})")
+
+    # fuente Capture: el visualizador gestiona el capturador — acá se simula
+    # uno ya corriendo (heartbeat fresco, sin spawn) y se verifica que la
+    # conexión ocurre sola recién cuando empiezan a fluir datos
+    import tempfile
+    from f1telem import config as f1cfg
+    from f1telem.sources.capture import CaptureSource as _CapSrc
+    os.environ["F1TELEM_NO_CAPTURE_SPAWN"] = "1"
+    # sandbox: el recordings real puede tener una captura activa ahora mismo
+    _old_lad = os.environ.get("LOCALAPPDATA")
+    os.environ["LOCALAPPDATA"] = tempfile.mkdtemp()
+    lock = f1cfg.capture_lock_path()
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("1")
+    win.source_combo.setCurrentIndex(win.source_combo.findData("capture"))
+    win.connect_btn.click()
+    pump(app, 0.4)
+    check(win.source is None and win._cap_waiting
+          and win.connect_btn.text() == "Cancel",
+          "captura: sin datos queda esperando al capturador")
+    check("aiting" in win.status_label.text(),
+          f"captura: estado de espera ({win.status_label.text()[:60]})")
+    win.connect_btn.click()  # cancelar la espera
+    pump(app, 0.2)
+    check(not win._cap_waiting and win.connect_btn.text() == "Connect"
+          and win.source is None, "captura: espera cancelable")
+    win.connect_btn.click()  # esperar de nuevo
+    pump(app, 0.3)
+    cap_path = f1cfg.recordings_dir() / "capture_wait_test.jsonl"
+    with open(cap_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"R": {"DriverList": {"1": {
+            "RacingNumber": "1", "Tla": "VER", "TeamColour": "3671C6"}}}}) + "\n")
+        data = _zpack({"Entries": [{
+            "Utc": "2026-07-06T14:00:00.0000000Z",
+            "Cars": {"1": {"Channels": {"0": 11000, "2": 250, "3": 7,
+                                        "4": 99, "5": 0, "45": 12}}},
+        }]})
+        f.write(json.dumps({"M": [{"H": "Streaming", "M": "feed",
+                                   "A": ["CarData.z", data, ""]}]}) + "\n")
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline and win.source is None:
+        pump(app, 0.2)
+    check(isinstance(win.source, _CapSrc),
+          "captura: conexión automática al empezar a fluir datos")
+    check(not win._cap_waiting and win.connect_btn.text() == "Disconnect",
+          "captura: la espera termina al conectar")
+    win.connect_btn.click()  # desconectar
+    pump(app, 0.4)
+    lock.unlink()
+    if _old_lad is not None:
+        os.environ["LOCALAPPDATA"] = _old_lad
+
     win.close()
     pump(app, 0.3)
 

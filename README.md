@@ -25,37 +25,66 @@ delta trace and per-sector/microsector delta cards updating in real time:
 | **Race 2** | Fixed X axis from 0 to the last meter of the lap. Each series overwrites ("eats") its own previous-lap line as it advances, with a visible gap ahead of each car's cursor. |
 | **Quali** | Comparison of the current lap against a **target lap** (any completed lap of any driver). Three levels: the channel traces (dashed target + live current laps), the **cumulative delta trace** (X = distance, Y = seconds gained/lost vs the target at every meter, X axes linked), and **per-driver cards** (up to 4, in a 2-column grid) with the total lap delta in large type and one row per sector: the sector chip on the left and its 8 microsectors aligned next to it — no horizontal scrolling; green = doing better, red = worse, and the most recently crossed microsector is highlighted. |
 | **Times / Gap** | Gap chart against a reference driver (marked "(ref)" in the legend; X = **track position**, with "total distance / L\<lap\> +\<meters\>" ticks and a vertical line at every lap boundary; window configurable from ½ to 20 laps or the whole session; Y = seconds, **+ = slower than the reference at the same position, − = faster**) plus comparison tables ordered by track position: summary (P1..Pn, current lap, last, best, S1-S3, gap), lap times per driver, microsector deltas (24 splits, green/red cells) and per-corner minimum speeds. Sectors and microsectors are **rolling** (current lap in real time; until crossed, the value from one lap ago, dimmed) and each driver's most recently completed microsector is highlighted. |
+| **Race trace** | Classic race-trace: each driver's cumulative gap against a **selectable reference** (the leader by default, or any driver), with **one point per official microsector** so the effect of every corner shows up, not just the per-lap cut. X = laps (configurable: last N laps or all), Y = seconds (configurable ±s or auto; losing time = the line drops). SC/VSC/flag periods are shaded in the background. |
 
 ## Data sources
 
-- **Demo (synthetic)** — 6 simulated cars on a fictional circuit. No network
-  needed; try the app and all its modes any time.
+The visualizer consumes two sources; going live against the F1 stream is the
+**capturer's** job (its own executable, next section):
+
 - **Replay (Fast-F1 historical)** — replays any real session (2018 onwards) as
   if it were live, with a speed multiplier (x1 to x25). The first load of a
   session downloads data (may take a few minutes); it is cached afterwards.
-- **Live (F1 Live Timing)** — SignalR Core client for
-  `livetiming.formula1.com/signalrcore`. It decodes `CarData.z` (speed, RPM,
+- **Capture (live / imported)** — follows a capture file written by the
+  **capturer** with minimal delay (new lines are decoded as soon as they hit
+  the disk, ~50 ms), whether it is a real live capture in progress or an
+  imported one replayed as live. The visualizer **manages the capturer**:
+  pressing Connect attaches immediately if a capture file is already
+  growing; otherwise it **opens the capturer automatically** (if it is not
+  already running — a heartbeat file tells) and stays waiting, connecting
+  **by itself the moment data starts flowing** (start a live capture or an
+  import in the capturer). The wait can be cancelled with the same button. The live client (SignalR Core against
+  `livetiming.formula1.com/signalrcore`) decodes `CarData.z` (speed, RPM,
   gear, throttle, brake, DRS at ~4 Hz per car) and `Position.z`, integrates
   speed to obtain distance and takes lap numbers from `TimingData`. **Data
   only flows while an official session is running**, and the full stream
-  requires an **F1TV subscription token** (the same one Fast-F1 uses; sign in
-  from the capture window). Every message is recorded to
-  `%LOCALAPPDATA%\f1telem\recordings\`.
-- **Capture (recorded live)** — follows a capture file written by the
-  **capturer** with minimal delay (new lines are decoded as soon as they hit
-  the disk, ~50 ms). The timeline lets you seek back anywhere in the session
-  while the capture keeps growing, and the red **LIVE** button jumps back to
-  the latest data.
+  requires an **F1TV subscription token** (sign in from the capturer). Every
+  message is recorded to `%LOCALAPPDATA%\f1telem\recordings\`. The timeline
+  lets you seek back anywhere in the session while the capture keeps
+  growing, and the red **LIVE** button jumps back to the latest data.
+
+(For development, `F1TELEM_DEV_SOURCES=1` adds the synthetic Demo and the
+direct Live client to the source list.)
 
 ## Capturer
 
 A companion app that ONLY captures the live stream to a file, so the
 visualizer (this app, even multiple instances) can follow it live or rewind
-without touching the network connection:
+without touching the network connection. It is a **separate executable**
+(`F1TelemCapture.exe`, its own `capture\` folder with an independent
+`_internal`) so the main app can be updated **without stopping a running
+capture** — the auto-updater replaces the visualizer and leaves the capturer
+untouched while it keeps recording (it updates the next time it is closed).
 
 ```powershell
-F1LiveTelemetry.exe --capture     # or: python -m f1telem --capture
+F1TelemCapture.exe        # or: .\capture.ps1  ·  python -m f1telem --capture
 ```
+
+### Import a recorded capture (replay as live)
+
+The capturer's **Import capture…** button replays any recorded `.jsonl`
+**as if the stream were arriving live**, transparently for the main app — it
+follows the new file with its *Capture (recorded live)* source and cannot
+tell real from imported. The model mirrors a real live session: you pick
+**where real-time playback starts** (`hh:mm:ss`, e.g. `00:01:30`), the
+**whole history from the race start up to that point is delivered
+instantly** (the main app always gets the complete picture, exactly like
+when it hooks into an ongoing live capture), and from there the data flows
+chronologically at real speed — no pause, no rewind, just like a live feed.
+Seeking around the received data is done in the main app's own timeline, as
+always. Playback uses a single working file (`import_live.jsonl`),
+overwritten on each import and removed on exit — replaying never piles up
+new capture files.
 
 It shows the output file, connection status and data counters, and offers
 **Sign in with F1TV…** (browser flow, token shared with Fast-F1). Then open
@@ -110,8 +139,13 @@ follows the most recent capture file.
 
 **If the automatic delivery fails**
 
-- The extension's Connect page shows the token with a **Copy** button:
-  copy it, then press **Paste token…** in the capturer and paste.
+- The extension's Connect page offers **Open in the app**: the browser
+  shows its native *"Open F1 Live Telemetry?"* dialog and hands the token
+  straight to the executable through the `f1telemetry://` link (the
+  capturer registers it per-user on start, no admin needed) — the running
+  capturer picks it up within seconds.
+- It also shows the token with a **Copy** button: copy it, then press
+  **Paste token…** in the capturer and paste.
 - Without any extension, **Paste token…** always works: sign in at
   `f1tv.formula1.com`, open DevTools (F12) → **Application** → **Cookies**
   → `https://f1tv.formula1.com`, copy the **value** of the `login-session`
@@ -122,8 +156,9 @@ follows the most recent capture file.
 ## Features
 
 - **Detachable panels**: every panel — timing tower, track map, Times/Gap
-  tables, Quali delta cards, each mode's central view (Race, Race 2,
-  Quali, Times/Gap), data source, driver selection, Mode box and the
+  tables, Quali delta cards, each mode's central view (Race, Race 2, Quali,
+  Times/Gap, Race trace), session strip, race control, tyre strategy,
+  weather, data source, driver selection, Mode box and the
   timeline — has a small title bar with a ⧉ button that pops it out into
   **its own window**, freely movable and resizable, plus a 📌 **pin**
   button that makes the floating window frameless, always-on-top and
@@ -136,6 +171,42 @@ follows the most recent capture file.
   the Race chart). The whole layout is **persistent**: window geometry,
   splitters and each panel's docked/floating state, position, size and
   pinned flag are reapplied exactly as they were on the next start.
+- **Layout profiles**: Panels… → *Layout profiles* saves the complete current
+  arrangement (visible panels, floating windows with position/size/pin,
+  splitters and window geometry) under a name — e.g. "Race 3 monitors",
+  "Quali compact" — and reapplies it with one click.
+- **Session strip** (banner above the charts, detachable like everything
+  else): meeting/session name, live **track-status badge**
+  (clear/yellow/SC/VSC/red), **LAP n/total** (races) and the **session clock**
+  (`ExtrapolatedClock`), plus the latest race-control message colored by
+  flag.
+- **Race control panel**: chronological log of every official message —
+  flags, SC/VSC deployments, investigations and penalties — with session
+  timestamps and lap numbers, colored by flag.
+- **Tyre strategy panel**: one bar per driver (ordered by position) with the
+  stints colored by compound (F1 convention) and the stint length inside,
+  clipped to the race distance, with a dashed line at the leader's current
+  lap. The tower also shows each car's **current compound and tyre age**
+  next to the driver code. Live data comes from `TimingAppData`; replay uses
+  Fast-F1 laps.
+- **Pit lane panel**: who is in the pit lane **right now**, the compound
+  they entered on, and two live clocks — total time in the lane and time
+  stationary (speed 0, from telemetry). The tower also shows each driver's
+  **last pit visit**: lap, time spent in the lane and time stopped (in
+  yellow while the car is still in the lane). Live detection uses the
+  official `InPit` flag; replay pairs Fast-F1 `PitInTime`/`PitOutTime`.
+- **Notification manager**: popup toasts (bottom-right, auto-dismiss) and a
+  log panel for session events — pit in / pit out (with lane and stopped
+  times), session fastest lap, **car stopped on track** (speed 0 outside
+  the pits, sustained), yellow flag, safety car, virtual safety car, red
+  flag and stewards' **penalties**. Each category can be toggled
+  individually and popups can be disabled; on connect, pre-existing history
+  sets a baseline silently (no notification flood), and timeline seeks
+  never re-announce past events.
+- **Weather panels**: current values (air, track, wind, rain) plus a
+  **weather evolution chart** — air/track temperature above and wind speed
+  below, with rain shaded — where the X axis is the **leader's race lap**
+  during races or the minutes since the session start otherwise.
 - **Tower font size**: A− / A+ buttons in the tower header scale its font
   and row heights (persisted).
 - **Pause and hot speed change** (demo/replay): the ⏸ button next to the
@@ -170,9 +241,9 @@ follows the most recent capture file.
 - **Stint summary** (Degradation tab): average pace and degradation slope
   (s/lap, linear fit) per stint and compound, next to the lap-time vs
   tyre-age chart (one series per stint, colored by compound).
-- **Tyres and strategy** (replay): the "By lap" table tints every cell by
-  compound, adds the tyre age in parentheses and marks pit-stop laps with
-  "P".
+- **Tyres and strategy**: the "By lap" table tints every cell by compound,
+  adds the tyre age in parentheses and marks pit-stop laps with "P" (live:
+  `TimingAppData` stints and official pit-stop counter; replay: Fast-F1).
 - **Flags and Safety Car**: background bands on the gap chart and the
   timeline, and the tower's header badge while yellow/SC/VSC/red is active.
   While a marshal sector is under yellow flag, that stretch of the **track
@@ -225,9 +296,17 @@ python -m venv .venv
 .\build.ps1
 ```
 
-Produces `dist\F1LiveTelemetry\F1LiveTelemetry.exe` (self-contained folder,
-no Python required) and `dist\F1LiveTelemetry-win64.zip`, ready to upload as
-the GitHub release asset.
+Produces `dist\F1LiveTelemetry\` with **two executables** —
+`F1LiveTelemetry.exe` (visualizer) and `capture\F1TelemCapture.exe`
+(capturer, its own `_internal`) — plus `dist\F1LiveTelemetry-win64.zip`,
+ready to upload as the GitHub release asset. No Python required.
+
+If **Inno Setup 6** is installed (`winget install JRSoftware.InnoSetup`),
+the build also produces `dist\F1LiveTelemetry-setup.exe`: a proper installer
+that installs into `%LOCALAPPDATA%\Programs\F1LiveTelemetry` (no admin
+required, so the auto-updater keeps working), creates Start-menu and
+optional desktop shortcuts, registers the `f1telemetry://` protocol for the
+F1TV sign-in extension and provides an uninstaller.
 
 ## Automatic updates
 
@@ -235,11 +314,15 @@ Both the visualizer and the capturer check the
 [latest GitHub release](https://github.com/frborda/F1-Live-Telemetry/releases)
 shortly after startup, and on demand via the **vX.Y.Z** button in the status
 bar (bottom-right corner of each window). When a newer version exists, a
-dialog shows its release notes and offers **Download and install**: the zip
-is downloaded to `%LOCALAPPDATA%\f1telem\updates`, verified against the
-sha256 digest published by GitHub, and an unattended script swaps the
-install folder once every running instance closes, then relaunches the app —
-with automatic rollback if the copy fails (see `update.log` in that folder).
+dialog shows its release notes and offers **Download and install**, with the
+**main app and the capturer selectable separately**: the zip is downloaded to
+`%LOCALAPPDATA%\f1telem\updates`, verified against the sha256 digest
+published by GitHub, and an unattended script applies what you picked — the
+main app is swapped once it closes and relaunched (automatic rollback if the
+copy fails; see `update.log`), while the capturer — its own executable and
+folder — is **never interrupted**: if it is recording, the installer waits in
+the background (up to 60 min) and replaces it as soon as it is closed.
+Updating only the capturer doesn't even close the main app.
 **Skip this version** silences that release; the startup check can be turned
 off from the same dialog (`updates.check_on_startup` in `config.json`).
 Running from source only opens the releases page.
@@ -257,6 +340,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python tests\updater_check.py # updater: versions, zip layout, install script
 .venv\Scripts\python tests\sector_bounds_check.py # official sectors: decode, bounds, anchoring
 .venv\Scripts\python tests\auth_check.py    # F1TV sign-in: token parsing + PNA header
+.venv\Scripts\python tests\import_check.py  # import player + transparent rewind
 ```
 
 ## Technical notes

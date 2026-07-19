@@ -114,6 +114,8 @@ class ReplaySource(BaseSource):
         self._emit_weather(session)
         self._emit_sector_yellows(session)
         self._emit_sector_times(session)
+        self._emit_race_control(session)
+        self._emit_session_meta(session)
         pos_stream = self._prepare_positions(session)
 
         stream = {
@@ -225,6 +227,39 @@ class ReplaySource(BaseSource):
                 stops.sort()
             if pits:
                 self.pits.emit(pits)
+        except Exception:
+            pass
+        self._emit_pit_lane(session)
+
+    def _emit_pit_lane(self, session) -> None:
+        """Visitas a la calle de boxes: entrada (PitInTime, fin de la vuelta
+        de entrada) apareada con la salida siguiente (PitOutTime)."""
+        try:
+            visits: dict[str, list] = {}
+            for num in session.drivers:
+                laps = session.laps.pick_drivers(str(num))
+                ins: list[tuple[float, int]] = []
+                outs: list[float] = []
+                for _, row in laps.iterrows():
+                    t_in = row.get("PitInTime")
+                    if t_in is not None and t_in == t_in:
+                        try:
+                            ins.append((float(t_in.total_seconds()),
+                                        int(row["LapNumber"])))
+                        except (ValueError, TypeError):
+                            continue
+                    t_out = row.get("PitOutTime")
+                    if t_out is not None and t_out == t_out:
+                        try:
+                            outs.append(float(t_out.total_seconds()))
+                        except (ValueError, TypeError):
+                            continue
+                outs.sort()
+                for t_in, lap in sorted(ins):
+                    t_out = next((t for t in outs if t > t_in), None)
+                    visits.setdefault(str(num), []).append([lap, t_in, t_out])
+            if visits:
+                self.pitLane.emit(visits)
         except Exception:
             pass
 
@@ -340,6 +375,55 @@ class ReplaySource(BaseSource):
                 self.sectorTimes.emit(reports)
         except Exception:
             pass  # sin tiempos de sector se mantienen los tercios de vuelta
+
+    def _emit_race_control(self, session) -> None:
+        """Mensajes de dirección de carrera con el mismo contrato que la
+        fuente en vivo (t relativo al inicio de la sesión)."""
+
+        def clean(value) -> str:
+            return "" if value is None or value != value else str(value)
+
+        try:
+            rows = []
+            for _, row in session.race_control_messages.iterrows():
+                try:
+                    t = float((row["Time"] - session.t0_date).total_seconds())
+                except (KeyError, TypeError):
+                    continue
+                lap = row.get("Lap")
+                sector = row.get("Sector")
+                rows.append({
+                    "t": t,
+                    "lap": int(lap) if lap is not None and lap == lap else None,
+                    "category": clean(row.get("Category")),
+                    "flag": clean(row.get("Flag")),
+                    "scope": clean(row.get("Scope")),
+                    "sector": int(sector) if sector is not None and sector == sector else None,
+                    "mode": "",
+                    "driver": clean(row.get("RacingNumber")),
+                    "message": clean(row.get("Message")),
+                })
+            if rows:
+                self.raceControl.emit(rows)
+        except Exception:
+            pass  # sin mensajes el panel queda vacío
+
+    def _emit_session_meta(self, session) -> None:
+        try:
+            info = getattr(session, "session_info", None) or {}
+            self.sessionMeta.emit({
+                "type": str(info.get("Type") or session.name or ""),
+                "meeting": str((info.get("Meeting") or {}).get("Name") or ""),
+                "name": str(info.get("Name") or session.name or ""),
+            })
+        except Exception:
+            pass
+        try:
+            total = getattr(session, "total_laps", None)
+            if total and total == total:
+                self.lapCount.emit((0, int(total)))
+        except Exception:
+            pass
 
     def _emit_outline(self, session) -> None:
         """Trazado del circuito: posiciones de la vuelta más rápida."""

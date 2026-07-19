@@ -29,6 +29,22 @@ def recordings_dir() -> Path:
     return data_dir() / "recordings"
 
 
+def capture_lock_path() -> Path:
+    """Latido del capturador: el proceso lo re-escribe cada segundo mientras
+    vive; el visualizador lo considera corriendo si el mtime es fresco."""
+    return data_dir() / "capture.lock"
+
+
+def capture_running(max_age: float = 5.0) -> bool:
+    import time
+
+    lock = capture_lock_path()
+    try:
+        return time.time() - lock.stat().st_mtime < max_age
+    except OSError:
+        return False
+
+
 DEFAULTS = {
     "replay": {"year": 2025, "gp": "Bahrain", "session": "R", "speed": 5.0},
     "ui": {

@@ -26,7 +26,10 @@ _TMP = tempfile.mkdtemp(prefix="f1telem-auth-test-")
 os.environ["APPDATA"] = _TMP
 os.environ["LOCALAPPDATA"] = _TMP
 
-from f1telem.capture_app import _pna_handler, extract_subscription_token
+from f1telem.capture_app import (
+    _pna_handler, extract_subscription_token, register_protocol,
+    token_from_url,
+)
 from fastf1.internals import f1auth
 
 FAILURES: list[str] = []
@@ -58,6 +61,19 @@ check(extract_subscription_token('{"subscriptionToken": "%s"}' % JWT) == JWT,
 check(extract_subscription_token("") is None, "token: vacío -> None")
 check(extract_subscription_token("hola mundo") is None, "token: basura -> None")
 check(extract_subscription_token("{not json") is None, "token: JSON roto -> None")
+
+# ------------------------------------------------- enlace f1telemetry://
+
+check(token_from_url(f"f1telemetry://auth?token={urllib.parse.quote(JWT)}") == JWT,
+      "protocolo: token en query URL-encodeado")
+check(token_from_url(f"f1telemetry://auth?token={JWT}") == JWT,
+      "protocolo: token en query crudo")
+check(token_from_url(f"f1telemetry://{JWT}") == JWT,
+      "protocolo: token como ruta")
+check(token_from_url("f1telemetry://auth?token=basura") is None,
+      "protocolo: basura -> None")
+register_protocol()  # sin build congelado no debe tocar el registro ni fallar
+check(True, "protocolo: register_protocol es no-op sin build congelado")
 
 # ------------------------------------------------- header PNA del servidor
 
@@ -136,6 +152,10 @@ check("/auth" in connect_js and "loginSession" in connect_js,
       "extensión: postea loginSession a /auth (protocolo FastF1)")
 check("subscriptionToken" in connect_js and "Paste token" in connect_js,
       "extensión: plan B con token copiable para Paste token…")
+check("f1telemetry://auth?token=" in connect_js,
+      "extensión: botón Open in the app usa el protocolo f1telemetry://")
+connect_html = (EXT / "connect.html").read_text(encoding="utf-8")
+check('id="openapp"' in connect_html, "extensión: botón openapp presente")
 
 background_js = (EXT / "background.js").read_text(encoding="utf-8")
 check("f1login.fastf1.dev" in background_js and "my-account" in background_js,

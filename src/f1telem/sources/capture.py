@@ -69,6 +69,15 @@ class CaptureSource(LiveDecoderMixin, BaseSource):
             return None
         return line
 
+    def _truncated(self, f) -> bool:
+        """El archivo se achicó desde la última lectura (el reproductor de
+        importación reescribió más corto al retroceder): hay que rebobinar."""
+        try:
+            import os as _os
+            return _os.fstat(f.fileno()).st_size < f.tell()
+        except OSError:
+            return False
+
     def _loop(self) -> None:
         f = open(self.path, "rb")
         self.statusChanged.emit(
@@ -80,6 +89,18 @@ class CaptureSource(LiveDecoderMixin, BaseSource):
         last_beat = 0.0
         try:
             while self._running:
+                # rebobinado transparente: si el archivo seguido se truncó
+                # (seek atrás del importador), releer desde cero como si fuera
+                # una nueva historia en vivo
+                if self.live_mode and self._truncated(f):
+                    self.seekReset.emit()
+                    self._init_decoder()
+                    self._t_end = 0.0
+                    self._max_lap_seen = 0
+                    self._marks.clear()
+                    f.close()
+                    f = open(self.path, "rb")
+                    continue
                 seek = self._seek_t
                 if seek is not None:
                     self._seek_t = None

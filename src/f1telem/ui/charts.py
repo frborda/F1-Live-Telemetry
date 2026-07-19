@@ -38,10 +38,15 @@ def series_pens(hub: DataHub, drivers: list[str]) -> dict[str, "pg.QtGui.QPen"]:
 
 
 class EdgeSmoother:
-    """Suaviza un valor que avanza a saltos (borde de ventana, punta de serie).
+    """Reproductor suave de un valor que avanza a saltos (borde de ventana,
+    punta de serie, reloj de posiciones).
 
-    Los datos llegan en lotes (~4-5 Hz); entre lotes se extrapola linealmente
-    con la velocidad aprendida para que a 30 fps el movimiento sea continuo.
+    Los datos llegan en lotes: en replay cada ~0,1-0,25 s, en vivo en ráfagas
+    de ~1,2 s. En vez de saltar al último valor y congelarse entre ráfagas,
+    esto REPRODUCE lo ya recibido a la velocidad aprendida, con un retardo de
+    ~una ráfaga (autoajustado a la cadencia observada) que absorbe el jitter:
+    acelera o frena suave según cuánto dato quede por reproducir y nunca pasa
+    el último dato real (no inventa futuro).
     `reset_drop`: retroceso del objetivo que se interpreta como reinicio
     (nueva sesión, o cruce de meta en ejes que se reinician por vuelta).
     """
@@ -54,19 +59,43 @@ class EdgeSmoother:
         self._target: float | None = None
         self._t = 0.0
         self._rate = 0.0
+        self._gap = 0.3   # cadencia observada entre lotes (s)
+        self._out = 0.0
+        self._t_out = 0.0
 
     def update(self, target: float, now: float) -> float:
         if self._target is None or target < self._target - self._reset_drop:
             self._target, self._t, self._rate = target, now, 0.0
+            self._out, self._t_out = target, now
+            self._gap = 0.3
             return target
         if target > self._target:
             dt = now - self._t
-            if dt > 1e-3:
+            # huecos gigantes (gráfico oculto, pausa) no enseñan velocidad
+            if 1e-3 < dt <= 5.0:
                 instant = (target - self._target) / dt
                 self._rate = instant if self._rate <= 0 else 0.6 * self._rate + 0.4 * instant
+                self._gap = min(0.8 * self._gap + 0.2 * dt, 2.5)
             self._target, self._t = target, now
-        # extrapolar como máximo ~0,6 s para no inventar futuro de más
-        return self._target + self._rate * min(now - self._t, 0.6)
+        dt_out = min(max(now - self._t_out, 0.0), 0.5)
+        self._t_out = now
+        if self._rate > 0.0:
+            # margen objetivo ~una ráfaga de datos por reproducir: con mucho
+            # acumulado acelera (hasta +70 %), con poco afloja (hasta −50 %)
+            horizon = self._rate * max(2.0 * self._gap, 0.2)
+            lead = self._target - self._out
+            if lead > horizon * 2.0:
+                # quedó demasiado atrás (vista recién mostrada, salto grande):
+                # re-enganchar en el punto de equilibrio en vez de perseguirlo
+                self._out = self._target - horizon * 0.5
+                lead = horizon * 0.5
+            gain = min(max(0.5 + lead / max(horizon, 1e-9), 0.0), 2.2)
+            self._out = min(self._out + self._rate * gain * dt_out, self._target)
+        else:
+            self._out = self._target
+        if now - self._t > 3.0:  # fuente pausada o terminada: pegarse al dato
+            self._out = self._target
+        return self._out
 
 
 def find_significant_peaks(x: np.ndarray, y: np.ndarray, max_labels: int = 14):
@@ -175,13 +204,14 @@ class HoverProbe(QObject):
     valor de todas las series visibles interpolado en ese X."""
 
     def __init__(self, plot: pg.PlotWidget, series_provider, x_format, y_format,
-                 hover_cb=None):
+                 hover_cb=None, sort_rows: bool = False):
         super().__init__(plot)
         self.plot = plot
         self.provider = series_provider  # () -> [(etiqueta, color, x_arr, y_arr)]
         self.x_format = x_format
         self.y_format = y_format
         self.hover_cb = hover_cb  # recibe la X del mouse (None al salir)
+        self.sort_rows = sort_rows  # ordenar por valor en el X del cursor
         self.rows: list[tuple[str, float]] = []  # última lectura (para tests)
 
         self.vline = pg.InfiniteLine(
@@ -228,6 +258,8 @@ class HoverProbe(QObject):
             y = float(np.interp(x, xd, yd))
             if math.isfinite(y):
                 rows.append((label, color, y))
+        if self.sort_rows:
+            rows.sort(key=lambda r: r[2])
         self.rows = [(lbl, y) for lbl, _c, y in rows]
         if not rows:
             self._hide()
@@ -388,6 +420,40 @@ class BaseChart(pg.PlotWidget):
 
     TIP_RESET_DROP = 1e4  # los ejes que se reinician por vuelta usan menos
 
+    def _tip_item(self, drv: str) -> pg.PlotDataItem:
+        tip = self._tips.get(drv)
+        if tip is None:
+            curve = self.curves.get(drv)
+            tip = pg.PlotDataItem()
+            if curve is not None:
+                tip.setPen(curve.opts.get("pen"))
+            self.addItem(tip, ignoreBounds=True)
+            self._tips[drv] = tip
+        return tip
+
+    def _cursor_tip(self, drv: str, x: np.ndarray, y: np.ndarray, k: int,
+                    x_head: float):
+        """Punta en el cursor de reproducción: une la última muestra dibujada
+        (índice k-1) con la posición interpolada x_head dentro del tramo
+        siguiente. Devuelve el punto mostrado (etiqueta / borde de ventana)."""
+        curve = self.curves.get(drv)
+        tip = self._tip_item(drv)
+        if curve is None or not curve.isVisible() or k <= 0:
+            tip.setData([], [])
+            return None
+        x0, y0 = float(x[k - 1]), float(y[k - 1])
+        if k < len(x):
+            x1, y1 = float(x[k]), float(y[k])
+            frac = min(max((x_head - x0) / max(x1 - x0, 1e-9), 0.0), 1.0)
+            xh, yh = x0 + (x1 - x0) * frac, y0 + (y1 - y0) * frac
+        else:
+            xh, yh = x0, y0
+        if xh > x0:
+            tip.setData([x0, xh], [y0, yh])
+        else:
+            tip.setData([], [])
+        return (xh, yh)
+
     def _render_tip(self, drv: str, x_cap: float | None = None):
         """Barre el último tramo REAL de la serie de forma continua.
 
@@ -402,12 +468,7 @@ class BaseChart(pg.PlotWidget):
         if state is None or curve is None:
             return None
         x_prev, y_prev, x_new, y_new = state
-        tip = self._tips.get(drv)
-        if tip is None:
-            tip = pg.PlotDataItem()
-            tip.setPen(curve.opts.get("pen"))
-            self.addItem(tip, ignoreBounds=True)
-            self._tips[drv] = tip
+        tip = self._tip_item(drv)
         if not curve.isVisible():
             tip.setData([], [])
             return None
@@ -571,6 +632,8 @@ class RollingChart(BaseChart):
         super().__init__(hub, parent)
         self.window_laps = 1.0
         self._seen_n: dict[str, int] = {}
+        self._xy: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._drawn_k: dict[str, int] = {}
         self._tick_n = 0
 
     def set_window_laps(self, laps: float) -> None:
@@ -579,9 +642,13 @@ class RollingChart(BaseChart):
     def clear_data(self) -> None:
         super().clear_data()
         self._seen_n.clear()
+        self._xy.clear()
+        self._drawn_k.clear()
 
     def on_channel_changed(self) -> None:
         self._seen_n.clear()  # mismo largo de datos pero hay que redibujar Y
+        self._xy.clear()
+        self._drawn_k.clear()
 
     def dist_at(self, x: float) -> float:
         L = self.hub.track_length
@@ -607,6 +674,7 @@ class RollingChart(BaseChart):
         allow_data = (not big) or (self._tick_n % 15 == 0)
         data_changed = False
         edge = 0.0
+        now = time.monotonic()
         for drv in self.selected:
             buf = self.hub.buffers.get(drv)
             curve = self.curves[drv]
@@ -629,14 +697,26 @@ class RollingChart(BaseChart):
                 i0 = 0
                 if self.window_laps > 0:
                     i0 = int(np.searchsorted(x, x[-1] - window * 1.05))
-                # la curva termina en la anteúltima muestra: el tramo final
-                # lo barre la punta suavizada sin correcciones
-                end = len(x) - 1 if len(x) - i0 >= 2 else len(x)
-                curve.setData(x[i0:end], y[i0:end])
-                self._store_segment(drv, x, y)
+                self._xy[drv] = (x[i0:], np.asarray(y[i0:], dtype=np.float64))
+                self._drawn_k[drv] = -1  # fuerza redibujo con el cursor nuevo
                 self._seen_n[drv] = buf.n
                 data_changed = True
-            tip = self._render_tip(drv)
+            xy = self._xy.get(drv)
+            if xy is None:
+                continue
+            x, y = xy
+            # cursor de reproducción: reproduce lo recibido de forma continua
+            # (~un lote de retardo); la curva se dibuja SOLO hasta el cursor,
+            # así las ráfagas del vivo no hacen saltar la línea
+            sm = self._tip_sm.get(drv)
+            if sm is None:
+                sm = self._tip_sm[drv] = EdgeSmoother(reset_drop=self.TIP_RESET_DROP)
+            x_head = sm.update(float(x[-1]), now)
+            k = int(np.searchsorted(x, x_head))
+            if k != self._drawn_k.get(drv) and (not big or allow_data):
+                curve.setData(x[:k], y[:k])
+                self._drawn_k[drv] = k
+            tip = self._cursor_tip(drv, x, y, k, x_head)
             if tip is None:
                 continue
             self._place_label(drv, tip[0], tip[1])
@@ -774,6 +854,8 @@ class QualyChart(BaseChart):
         self.reference: tuple[str, int] | None = None
         self._ref_data: dict[str, np.ndarray] | None = None
         self._seen_n: dict[str, int] = {}
+        self._xy: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._drawn_k: dict[str, int] = {}
         self._ref_curve = pg.PlotDataItem(connect="finite")
         self.addItem(self._ref_curve)
         hub.trackLengthChanged.connect(lambda _m: self._apply_x_range())
@@ -833,13 +915,18 @@ class QualyChart(BaseChart):
     def on_channel_changed(self) -> None:
         self._draw_reference()
         self._seen_n.clear()
+        self._xy.clear()
+        self._drawn_k.clear()
 
     def clear_data(self) -> None:
         super().clear_data()
         self._seen_n.clear()
+        self._xy.clear()
+        self._drawn_k.clear()
 
     def refresh(self) -> None:
         data_changed = False
+        now = time.monotonic()
         for drv in self.selected:
             buf = self.hub.buffers.get(drv)
             curve = self.curves[drv]
@@ -851,14 +938,29 @@ class QualyChart(BaseChart):
                 data = buf.lap_slice(buf.current_lap())
                 if not len(data["t"]):
                     curve.setData([], [])
+                    self._xy.pop(drv, None)
                     continue
-                x = data["dist_lap"]
-                y = data[self.channel]
-                end = len(x) - 1 if len(x) >= 2 else len(x)
-                curve.setData(x[:end], y[:end])
+                self._xy[drv] = (
+                    np.asarray(data["dist_lap"], dtype=np.float64),
+                    np.asarray(data[self.channel], dtype=np.float64),
+                )
+                self._drawn_k[drv] = -1
                 data_changed = True
-                self._store_segment(drv, x, y)
-            tip = self._render_tip(drv, x_cap=self.hub.track_length)
+            xy = self._xy.get(drv)
+            if xy is None:
+                continue
+            x, y = xy
+            # cursor de reproducción (ver RollingChart): la vuelta en curso se
+            # dibuja hasta donde el cursor reprodujo, sin saltos por ráfagas
+            sm = self._tip_sm.get(drv)
+            if sm is None:
+                sm = self._tip_sm[drv] = EdgeSmoother(reset_drop=self.TIP_RESET_DROP)
+            x_head = min(sm.update(float(x[-1]), now), self.hub.track_length)
+            k = int(np.searchsorted(x, x_head))
+            if k != self._drawn_k.get(drv):
+                curve.setData(x[:k], y[:k])
+                self._drawn_k[drv] = k
+            tip = self._cursor_tip(drv, x, y, k, x_head)
             if tip is not None:
                 self._place_label(drv, tip[0], tip[1])
         if data_changed:

@@ -9,6 +9,8 @@ dibujan la pista.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QPointF
@@ -16,7 +18,7 @@ from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPen
 
 from ..hub import DataHub
 from . import theme
-from .charts import series_pens
+from .charts import EdgeSmoother, series_pens
 
 TRAIL_SEC = 5.0  # largo de la estela detrás de cada auto (en tiempo de sesión)
 
@@ -28,9 +30,10 @@ class TrackMapView(pg.PlotWidget):
         self.selected: list[str] = []
         self.trails: dict[str, pg.PlotDataItem] = {}
         self.labels: dict[str, pg.TextItem] = {}
-        # posición mostrada por auto, con easing hacia la última muestra para
-        # que los puntos se muevan fluido a 30 fps en vez de a saltos
-        self._disp: dict[str, tuple[float, float]] = {}
+        # reloj de reproducción por auto: el punto se interpola SOBRE la
+        # trayectoria recibida con ~un lote de retardo, así se mueve fluido y
+        # por la traza real aunque el feed llegue en ráfagas (vivo)
+        self._tsm: dict[str, EdgeSmoother] = {}
         self._trails_enabled = True
         self._outline_len = -1
         self._corner_items: list[pg.TextItem] = []
@@ -152,7 +155,7 @@ class TrackMapView(pg.PlotWidget):
 
     def clear_data(self) -> None:
         self._outline_len = -1
-        self._disp.clear()
+        self._tsm.clear()
         for item in self._corner_items:
             self.removeItem(item)
         self._corner_items = []
@@ -213,6 +216,7 @@ class TrackMapView(pg.PlotWidget):
 
         pens = series_pens(self.hub, self.selected)
         spots = []
+        now = time.monotonic()
         for drv in self.selected:
             pb = self.hub.positions.get(drv)
             trail = self.trails[drv]
@@ -226,9 +230,15 @@ class TrackMapView(pg.PlotWidget):
             y = np.fromiter(pb.y, dtype=np.float64)
             info = self.hub.drivers.get(drv)
             color = info.color if info else "#9aa0a6"
+            # reloj suavizado: reproduce la trayectoria recibida en continuo
+            sm = self._tsm.get(drv)
+            if sm is None:
+                sm = self._tsm[drv] = EdgeSmoother(reset_drop=30.0)
+            t_render = sm.update(float(t[-1]), now)
             if self._trails_enabled:
-                i0 = int(np.searchsorted(t, t[-1] - TRAIL_SEC))
-                xs_t, ys_t = x[i0:], y[i0:]
+                i0 = int(np.searchsorted(t, t_render - TRAIL_SEC))
+                i1 = max(int(np.searchsorted(t, t_render, side="right")), i0 + 1)
+                xs_t, ys_t = x[i0:i1], y[i0:i1]
                 trail.setData(xs_t, ys_t)
                 if len(xs_t) >= 2:
                     # degradado: transparente en la cola, pleno en el auto
@@ -248,12 +258,9 @@ class TrackMapView(pg.PlotWidget):
                     if base is not None:
                         pen.setStyle(base.style())  # compañeros: trazo distinto
                     trail.setPen(pen)
-            # easing hacia la última muestra: movimiento fluido entre lotes
-            target = (float(x[-1]), float(y[-1]))
-            prev = self._disp.get(drv, target)
-            pos = (prev[0] + (target[0] - prev[0]) * 0.35,
-                   prev[1] + (target[1] - prev[1]) * 0.35)
-            self._disp[drv] = pos
+            # posición interpolada sobre la traza real en el reloj suavizado
+            pos = (float(np.interp(t_render, t, x)),
+                   float(np.interp(t_render, t, y)))
             spots.append({
                 "pos": pos,
                 "brush": pg.mkBrush(color),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 import urllib.parse
@@ -16,14 +17,19 @@ import webbrowser
 
 from PySide6.QtCore import QTimer, Signal, QObject
 from PySide6.QtWidgets import (
-    QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QMessageBox,
-    QPushButton, QVBoxLayout, QWidget,
+    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+    QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
 from . import __version__, config
+from .sources.importer import ImportPlayer, parse_hms
 from .sources.live import LiveSource
 from .ui import theme
 from .ui.update_dialog import run_check
+
+# archivo de trabajo ÚNICO de la reproducción importada: se sobrescribe en
+# cada importación y se borra al salir — reproducir no acumula archivos
+IMPORT_PLAYBACK_NAME = "import_live.jsonl"
 
 
 def _pna_handler(base):
@@ -65,6 +71,39 @@ def save_token(token: str) -> None:
     from fastf1.internals import f1auth
     f1auth._subscription_token = token
     f1auth.AUTH_DATA_FILE.write_text(token)
+
+
+def token_from_url(url: str) -> str | None:
+    """Token del enlace f1telemetry://auth?token=... que abre la extensión
+    (vía el diálogo nativo del navegador 'Abrir F1 Live Telemetry')."""
+    parsed = urllib.parse.urlparse(url)
+    raw = (urllib.parse.parse_qs(parsed.query).get("token") or [""])[0]
+    if not raw:
+        raw = urllib.parse.unquote(parsed.netloc + parsed.path)
+    return extract_subscription_token(raw)
+
+
+def register_protocol() -> None:
+    """Asocia f1telemetry:// a este exe (HKCU, sin permisos de admin): la
+    extensión puede entregar el token con el diálogo nativo del navegador,
+    sin pasar por localhost. Solo aplica al build congelado."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        import winreg
+
+        root = winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Classes\f1telemetry"
+        )
+        winreg.SetValueEx(root, None, 0, winreg.REG_SZ, "URL:F1 Live Telemetry")
+        winreg.SetValueEx(root, "URL Protocol", 0, winreg.REG_SZ, "")
+        cmd = winreg.CreateKey(root, r"shell\open\command")
+        winreg.SetValueEx(cmd, None, 0, winreg.REG_SZ,
+                          f'"{sys.executable}" "%1"')
+        winreg.CloseKey(cmd)
+        winreg.CloseKey(root)
+    except OSError:
+        pass  # sin registro queda el flujo por localhost / pegar token
 
 
 class _AuthWorker(QObject):
@@ -136,6 +175,7 @@ class CaptureWindow(QWidget):
         self._samples = 0
         self._positions = 0
         self._drivers = 0
+        self._import_mode = False
 
         lay = QVBoxLayout(self)
         box = QGroupBox("Live capture")
@@ -166,18 +206,28 @@ class CaptureWindow(QWidget):
             "reach the app), paste the F1TV login-session cookie or token here."
         )
         self.paste_btn.clicked.connect(self._paste_token)
+        self.import_btn = QPushButton("Import capture…")
+        self.import_btn.setToolTip(
+            "Replay a recorded capture as if it were arriving live: the full\n"
+            "history up to the chosen start minute is delivered at once (the\n"
+            "main app always sees the whole race) and from there it plays in\n"
+            "real time, just like a live session."
+        )
+        self.import_btn.clicked.connect(self._import)
         buttons.addWidget(self.toggle_btn)
         buttons.addWidget(self.auth_btn)
         buttons.addWidget(self.paste_btn)
+        buttons.addWidget(self.import_btn)
         buttons.addStretch(1)
         self.version_btn = QPushButton(f"v{__version__}")
         self.version_btn.setFlat(True)
         self.version_btn.setToolTip("Check for updates")
         self.version_btn.clicked.connect(
-            lambda: run_check(self, self.cfg, silent=False)
+            lambda: run_check(self, self.cfg, silent=False, allow_install=False)
         )
         buttons.addWidget(self.version_btn)
         lay.addLayout(buttons)
+
         hint = QLabel(
             "Open the main app and pick the \"Capture (recorded live)\" source\n"
             "to follow this file live or seek back in time."
@@ -188,6 +238,10 @@ class CaptureWindow(QWidget):
         self._auth = _AuthWorker()
         self._auth.done.connect(self._on_auth_done)
         self._auth.progress.connect(self.status_label.setText)
+        register_protocol()  # habilita el enlace f1telemetry:// del navegador
+        self._tok_present = LiveSource.stored_token() is not None
+        self._refresh_n = 0
+        self._write_heartbeat()  # el visualizador sabe que estamos abiertos
         self._update_token_label()
 
         self._timer = QTimer(self)
@@ -199,7 +253,8 @@ class CaptureWindow(QWidget):
         if (bool(self.cfg.get("updates", {}).get("check_on_startup", True))
                 and not os.environ.get("F1TELEM_NO_UPDATE_CHECK")):
             QTimer.singleShot(
-                3000, lambda: run_check(self, self.cfg, silent=True)
+                3000, lambda: run_check(self, self.cfg, silent=True,
+                                        allow_install=False)
             )
 
     # ------------------------------------------------------------------
@@ -257,10 +312,83 @@ class CaptureWindow(QWidget):
         self.toggle_btn.setText("Start capture")
 
     def _toggle(self) -> None:
+        if self._import_mode:
+            self._stop()
+            self._import_mode = False
+            self.import_btn.setEnabled(True)
+            self._cleanup_playback_file()
+            self._start()  # volver a captura en vivo
+            return
         if self.source is not None:
             self._stop()
         else:
             self._start()
+
+    # ------------------------------------------------------------ importar
+
+    @staticmethod
+    def _fmt_mmss(seconds: float) -> str:
+        seconds = max(0.0, seconds)
+        return f"{int(seconds // 60)}:{int(seconds % 60):02d}"
+
+    def _cleanup_playback_file(self) -> None:
+        """Borra el archivo de trabajo de la reproducción (mejor esfuerzo: si
+        el visualizador todavía lo tiene abierto, quedará para la próxima
+        sobrescritura)."""
+        try:
+            (config.recordings_dir() / IMPORT_PLAYBACK_NAME).unlink()
+        except OSError:
+            pass
+
+    def _import(self) -> None:
+        rec_dir = config.recordings_dir()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import capture", str(rec_dir), "Captures (*.jsonl)"
+        )
+        if not path:
+            return
+        out = str(rec_dir / IMPORT_PLAYBACK_NAME)
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(out):
+            QMessageBox.warning(
+                self, "F1 Live Telemetry",
+                "That file is the playback working file itself — pick a"
+                " recorded capture.",
+            )
+            return
+        text, ok = QInputDialog.getText(
+            self, "Import capture",
+            "Start real-time playback at (hh:mm:ss). The full history up to\n"
+            "that point is delivered instantly, so the main app always sees\n"
+            "the whole race:",
+            text="00:00:00",
+        )
+        if not ok:
+            return
+        start_at = parse_hms(text)
+        if start_at is None:
+            QMessageBox.warning(
+                self, "F1 Live Telemetry",
+                f"Could not parse '{text}'. Use hh:mm:ss, e.g. 00:01:30.",
+            )
+            return
+        self._stop()
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        self.path = out
+        self.path_label.setText(out)
+        player = ImportPlayer(path, out, start_at=start_at)
+        player.progress.connect(self._on_import_progress)
+        player.failed.connect(self.status_label.setText)
+        player.statusChanged.connect(self.status_label.setText)
+        self.source = player
+        self._import_mode = True
+        self.import_btn.setEnabled(False)
+        self.toggle_btn.setText("Back to live capture")
+        player.start()
+
+    def _on_import_progress(self, t0: float, t_now: float, t_end: float) -> None:
+        self.counter_label.setText(
+            f"import: {self._fmt_mmss(t_now)} / {self._fmt_mmss(t_end)}"
+        )
 
     def _sign_in(self) -> None:
         self.auth_btn.setEnabled(False)
@@ -286,9 +414,35 @@ class CaptureWindow(QWidget):
             f"samples: {self._samples:,} · positions: {self._positions:,}"
             f" · drivers: {self._drivers}"
         )
+        # otro proceso pudo guardar el token (enlace f1telemetry:// del
+        # navegador): reflejarlo sin reiniciar
+        self._refresh_n += 1
+        if self._refresh_n % 2 == 0:  # latido cada ~1 s para el visualizador
+            self._write_heartbeat()
+        if self._refresh_n % 4 == 0:
+            present = LiveSource.stored_token() is not None
+            if present != self._tok_present:
+                self._tok_present = present
+                self._update_token_label()
+                if present:
+                    self.status_label.setText("F1TV token detected — saved.")
+
+    def _write_heartbeat(self) -> None:
+        try:
+            lock = config.capture_lock_path()
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
 
     def closeEvent(self, event) -> None:
         self._stop()
+        if self._import_mode:
+            self._cleanup_playback_file()
+        try:
+            config.capture_lock_path().unlink(missing_ok=True)
+        except OSError:
+            pass
         super().closeEvent(event)
 
 

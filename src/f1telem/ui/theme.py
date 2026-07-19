@@ -26,6 +26,30 @@ TRACK_STATUS = {
     "7": ("VSC ENDING", "#ffd12e"),
 }
 
+# compuesto de neumático -> color (convención de la F1)
+COMPOUND_COLORS = {
+    "SOFT": "#e10600",
+    "SUPERSOFT": "#da0640",
+    "ULTRASOFT": "#a80a9c",
+    "HYPERSOFT": "#feb1c1",
+    "MEDIUM": "#ffd12e",
+    "HARD": "#f0f0f0",
+    "INTERMEDIATE": "#43b02a",
+    "WET": "#0067ad",
+}
+
+# bandera de dirección de carrera -> color de texto del mensaje
+FLAG_COLORS = {
+    "YELLOW": "#ffd12e",
+    "DOUBLE YELLOW": "#ffd12e",
+    "RED": "#ff4d4d",
+    "GREEN": "#2fbf71",
+    "CLEAR": "#2fbf71",
+    "BLUE": "#4c8dff",
+    "BLACK AND WHITE": "#e8eaed",
+    "CHEQUERED": "#e8eaed",
+}
+
 
 def apply_theme(app: QApplication) -> None:
     app.setStyle("Fusion")

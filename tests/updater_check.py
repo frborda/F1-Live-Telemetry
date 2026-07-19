@@ -96,6 +96,13 @@ target = Path(_TMP) / "install"
 (target / "_internal" / "lib.dll").write_text("old-lib")
 (target / "_internal" / "stale.dll").write_text("only-in-old")
 (target / "user-notes.txt").write_text("keep-me")
+# capturador con su propia carpeta (exe separado)
+(target / "capture" / "_internal").mkdir(parents=True)
+(target / "capture" / "F1TelemCapture.exe").write_text("old-cap")
+(target / "capture" / "_internal" / "cap.dll").write_text("old-cap-lib")
+(payload / "capture" / "_internal").mkdir(parents=True)
+(payload / "capture" / "F1TelemCapture.exe").write_text("new-cap")
+(payload / "capture" / "_internal" / "cap.dll").write_text("new-cap-lib")
 
 script = staging / "apply_update.ps1"
 script.write_text(updater._HELPER, encoding="utf-8-sig")
@@ -125,7 +132,59 @@ check((target / "user-notes.txt").read_text() == "keep-me",
 check(not (target / "F1LiveTelemetry.exe.old").exists(), "helper: limpia el backup")
 check(not (target / "_internal.old").exists(), "helper: limpia _internal.old")
 check(not payload.exists(), "helper: limpia el payload extraído")
-check("Update applied" in log_text, "helper: log de éxito")
+check("Main app updated" in log_text, "helper: log de éxito de la app")
+check((target / "capture" / "F1TelemCapture.exe").read_text() == "new-cap",
+      "helper: capturador reemplazado (sin capturador corriendo)")
+check("Capturer updated" in log_text, "helper: log de éxito del capturador")
+
+# ------------------------------------------- instalación por componente
+
+# solo el capturador (DoMain=0): la app principal no se toca
+payload2 = staging / "payload2"
+(payload2 / "capture" / "_internal").mkdir(parents=True)
+(payload2 / "F1LiveTelemetry.exe").write_text("newer-exe")
+(payload2 / "capture" / "F1TelemCapture.exe").write_text("cap-v2")
+(payload2 / "capture" / "_internal" / "cap.dll").write_text("cap-lib-v2")
+log2 = staging / "update2.log"
+result = subprocess.run(
+    [updater._powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass",
+     "-File", str(script),
+     "-ProcId", str(proc.pid),
+     "-Source", str(payload2),
+     "-Target", str(target),
+     "-LogPath", str(log2),
+     "-DoMain", "0", "-DoCapture", "1"],
+    capture_output=True, text=True, timeout=180,
+)
+log2_text = log2.read_text() if log2.exists() else "(sin log)"
+check(result.returncode == 0, f"helper: solo-capturador exit 0 ({log2_text.strip()[-200:]})")
+check((target / "F1LiveTelemetry.exe").read_text() == "new-exe",
+      "helper: DoMain=0 no toca la app principal")
+check((target / "capture" / "F1TelemCapture.exe").read_text() == "cap-v2",
+      "helper: DoCapture=1 reemplaza el capturador")
+
+# solo la app (DoCapture=0): el capturador no se toca
+payload3 = staging / "payload3"
+(payload3 / "_internal").mkdir(parents=True)
+(payload3 / "F1LiveTelemetry.exe").write_text("exe-v3")
+(payload3 / "_internal" / "lib.dll").write_text("lib-v3")
+(payload3 / "capture").mkdir()
+(payload3 / "capture" / "F1TelemCapture.exe").write_text("cap-v3")
+log3 = staging / "update3.log"
+result = subprocess.run(
+    [updater._powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass",
+     "-File", str(script),
+     "-ProcId", str(proc.pid),
+     "-Source", str(payload3),
+     "-Target", str(target),
+     "-LogPath", str(log3),
+     "-DoMain", "1", "-DoCapture", "0"],
+    capture_output=True, text=True, timeout=180,
+)
+check((target / "F1LiveTelemetry.exe").read_text() == "exe-v3",
+      "helper: DoMain=1 reemplaza la app")
+check((target / "capture" / "F1TelemCapture.exe").read_text() == "cap-v2",
+      "helper: DoCapture=0 no toca el capturador")
 
 # ------------------------------------------------------- limpieza
 

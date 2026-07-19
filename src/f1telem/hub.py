@@ -129,6 +129,13 @@ class DataHub(QObject):
         self.track_status: list[tuple[float, float, str]] = []
         self.weather: list[tuple[float, float, float, float, bool]] = []
         self.sector_yellows: list[tuple[float, float, float, float]] = []
+        # visitas a la calle de boxes: {driver: [[vuelta, t_in, t_out|None]]}
+        self.pit_lane: dict[str, list[list]] = {}
+        # dirección de carrera, reloj de sesión y contador de vueltas
+        self.race_control: list[dict] = []
+        self.session_clock: tuple | None = None  # (t_rel, restante_s, extrapolando)
+        self.lap_count: tuple[int, int] = (0, 0)
+        self.session_meta: dict = {}
         # límites oficiales de sector (fin de S1, fin de S2) en metros de
         # vuelta, derivados de los tiempos de sector del feed / FastF1
         self.sector_bounds: tuple[float, float] | None = None
@@ -145,7 +152,11 @@ class DataHub(QObject):
         self.latest_t = 0.0
         self._dist_map = None
         self._dist_map_len = -1
-        self._lap1_offsets: dict[str, float] = {}
+        self._start_offsets: dict[str, float] = {}
+        # corrección de marco pendiente por auto (conexión a mitad de vuelta):
+        # (offset, vuelta de entrada) — se aplica a las muestras que sigan
+        # llegando en el marco viejo hasta el primer cruce real de meta
+        self._dist_fix: dict[str, tuple[float, int]] = {}
         self.track_length = self.DEFAULT_TRACK_LEN
         self.total_samples = 0
         self._track_exact = False
@@ -164,7 +175,8 @@ class DataHub(QObject):
         self.total_samples = 0
         self.latest_t = 0.0
         self._lap_len_obs.clear()
-        self._lap1_offsets.clear()
+        self._start_offsets.clear()
+        self._dist_fix.clear()
         self.segments.clear()
 
     def on_corners(self, corners) -> None:
@@ -184,6 +196,71 @@ class DataHub(QObject):
 
     def on_sector_yellows(self, periods) -> None:
         self.sector_yellows = list(periods)
+
+    def on_pit_lane(self, data) -> None:
+        self.pit_lane = {drv: [list(v) for v in visits]
+                         for drv, visits in data.items()}
+
+    def last_pit_visit(self, drv: str) -> list | None:
+        visits = self.pit_lane.get(drv)
+        return visits[-1] if visits else None
+
+    def pit_stationary_time(self, drv: str, t0: float, t1: float) -> float:
+        """Segundos detenido (velocidad ~0) entre t0 y t1, de la telemetría."""
+        buf = self.buffers.get(drv)
+        if buf is None or buf.n < 2:
+            return 0.0
+        t = buf.col("t")
+        i0 = int(np.searchsorted(t, t0))
+        i1 = int(np.searchsorted(t, t1))
+        if i1 - i0 < 2:
+            return 0.0
+        dt = np.diff(t[i0:i1])
+        stopped = (buf.col("speed")[i0 + 1:i1] <= 0.5) & (dt <= 5.0)
+        return float(dt[stopped].sum())
+
+    def on_race_control(self, rows) -> None:
+        self.race_control = list(rows)
+
+    def on_session_clock(self, value) -> None:
+        self.session_clock = tuple(value) if value else None
+
+    def on_lap_count(self, value) -> None:
+        try:
+            self.lap_count = (int(value[0]), int(value[1]))
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    def on_session_meta(self, meta) -> None:
+        if isinstance(meta, dict):
+            self.session_meta.update(meta)
+
+    def clock_remaining(self) -> float | None:
+        """Tiempo restante de sesión al instante más reciente de datos
+        (extrapola desde la última lectura del reloj si corresponde)."""
+        if self.session_clock is None:
+            return None
+        t_ref, remaining, extrapolating = self.session_clock
+        if not extrapolating:
+            return remaining
+        return max(0.0, remaining - max(0.0, self.latest_t - t_ref))
+
+    def leader_laps_at(self, ts) -> np.ndarray:
+        """Vuelta (continua: vuelta + fracción) del auto más adelantado en
+        cada instante de `ts` — eje X del gráfico de clima en carrera."""
+        ts = np.asarray(ts, dtype=float)
+        out = np.zeros(len(ts))
+        L = max(self.track_length, 1.0)
+        for buf in self.buffers.values():
+            if not buf.n:
+                continue
+            t_col = buf.col("t")
+            idx = np.clip(np.searchsorted(t_col, ts, side="right") - 1, 0, buf.n - 1)
+            laps = (buf.col("lap")[idx].astype(float)
+                    + np.clip(buf.col("dist_lap")[idx] / L, 0.0, 1.0))
+            laps[ts < float(t_col[0])] = 0.0
+            np.maximum(out, laps, out=out)
+        return out
 
     def on_sector_times(self, batch) -> None:
         """Tiempos oficiales: [(driver, vuelta, índice, segundos)] con
@@ -210,6 +287,23 @@ class DataHub(QObject):
 
     BOUNDS_MIN_OBS = 6     # observaciones mínimas por límite para publicarlo
     BOUNDS_DONE_OBS = 400  # con estas observaciones se considera convergido
+
+    def _apply_pending_dist_fix(self, drv: str, buf: SeriesBuffer,
+                                start: int) -> None:
+        """Corrige las muestras recién llegadas mientras la vuelta de entrada
+        siga en el marco del punto de conexión; al primer cruce real el
+        decodificador ya ancla en la meta y la corrección se retira."""
+        fix = self._dist_fix.get(drv)
+        if fix is None:
+            return
+        offset, join_lap = fix
+        lapcol = buf.col("lap")
+        end = buf.n
+        if int(lapcol[-1]) > join_lap:
+            end = int(np.searchsorted(lapcol, join_lap, side="right"))
+            del self._dist_fix[drv]
+        if end > start:
+            buf._arr["dist_lap"][start:end] -= offset
 
     def _lap_t0(self, buf: SeriesBuffer, lap: int) -> float | None:
         """Instante del cruce de meta que abre la vuelta (interpolado entre
@@ -301,6 +395,11 @@ class DataHub(QObject):
         self.track_status = []
         self.weather = []
         self.sector_yellows = []
+        self.pit_lane = {}
+        self.race_control = []
+        self.session_clock = None
+        self.lap_count = (0, 0)
+        self.session_meta = {}
         self.sector_bounds = None
         self.official_times.clear()
         self.live_frames = False
@@ -312,7 +411,7 @@ class DataHub(QObject):
         self.outline = None
         self._dist_map = None
         self._dist_map_len = -1
-        self._lap1_offsets.clear()
+        self._start_offsets.clear()
         self._outline_drv = None
         self._outline_pts = None
         self.track_length = self.DEFAULT_TRACK_LEN
@@ -355,7 +454,9 @@ class DataHub(QObject):
                     self.driversChanged.emit()
             if not self._track_exact:
                 self._observe_lap_length(buf, group)
+            n0 = buf.n
             buf.append(group)
+            self._apply_pending_dist_fix(drv, buf, n0)
         if samples:
             self.latest_t = max(self.latest_t, samples[-1].t)
         self.total_samples += len(samples)
@@ -385,12 +486,15 @@ class DataHub(QObject):
             self._dist_map_len = len(xs)
         return self._dist_map
 
-    def provisional_lap1_offset(self, drv: str) -> float | None:
-        """Offset de grilla estimado DURANTE la vuelta 1: proyecta la última
-        posición (x, y) sobre el trazado para conocer el metro físico real y
-        lo compara con la distancia recorrida. Permite calcular gaps reales
-        desde el fin del S1, sin esperar a que cierre la vuelta 1."""
-        cached = self._lap1_offsets.get(drv)
+    def provisional_start_offset(self, drv: str) -> float | None:
+        """Offset provisional del primer tramo observado (aún sin cruce de
+        meta en los datos): proyecta la última posición (x, y) sobre el
+        trazado para conocer el metro físico real y lo compara con la
+        distancia integrada. Cubre la vuelta 1 (offset de grilla) y la
+        conexión a mitad de sesión, donde cada auto arranca con distancia 0
+        en cualquier punto de la pista (sin esto la torre ordenaba mal hasta
+        que todos cruzaban la meta)."""
+        cached = self._start_offsets.get(drv)
         if cached is not None:
             return cached
         buf = self.buffers.get(drv)
@@ -398,10 +502,11 @@ class DataHub(QObject):
         mapping = self.outline_dist_map()
         if buf is None or not buf.n or pb is None or not len(pb) or mapping is None:
             return None
-        if buf.current_lap() != 1:
-            return None
+        lapcol = buf.col("lap")
+        if int(lapcol[-1]) > int(lapcol[0]):
+            return None  # ya se observó un cruce: el ancla es real
         if float(buf.col("dist_lap")[-1]) < 300.0:
-            return None  # todavía en la zona de la grilla
+            return None  # muy poca integración para comparar
         # distancia recorrida en el instante de la última posición conocida
         driven = float(np.interp(pb.t[-1], buf.col("t"), buf.col("dist_lap")))
         if driven < 250.0:
@@ -410,10 +515,23 @@ class DataHub(QObject):
         d2 = (xs - pb.x[-1]) ** 2 + (ys - pb.y[-1]) ** 2
         phys = float(dist_arr[int(np.argmin(d2))])
         offset = driven - phys
-        if offset < -100.0 or offset > 1000.0:
-            return None  # proyección dudosa
-        offset = max(offset, 0.0)
-        self._lap1_offsets[drv] = offset
+        if int(lapcol[-1]) == 1:
+            # largada: el auto parte de la grilla, el offset es chico y >= 0
+            if offset < -100.0 or offset > 1000.0:
+                return None  # proyección dudosa
+            offset = max(offset, 0.0)
+        else:
+            if abs(offset) > 1.5 * self.track_length:
+                return None  # proyección dudosa
+            # conexión a mitad de vuelta: REESCRIBIR el tramo no anclado para
+            # que dist_lap mida desde la meta real del circuito (el eje X de
+            # los gráficos usa esa columna; sin esto el 0 quedaba en el punto
+            # de conexión). Las muestras que sigan llegando en el marco viejo
+            # se corrigen en on_batch hasta el primer cruce real.
+            buf._arr["dist_lap"][:buf.n] -= offset
+            self._dist_fix[drv] = (offset, int(lapcol[-1]))
+            offset = 0.0
+        self._start_offsets[drv] = offset
         return offset
 
     def on_positions(self, batch: list) -> None:

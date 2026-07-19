@@ -23,6 +23,11 @@ class BaseSource(QThread):
     sectorYellows = Signal(object)    # [(t0, t1, d0, d1)] amarillas por sector
     sectorTimes = Signal(object)      # [(driver, vuelta, sector 0|1, segundos)] oficiales
     segmentStatus = Signal(object)    # [(driver, sector, µsector, estado)] feed oficial
+    pitLane = Signal(object)          # {driver: [[vuelta, t_in, t_out|None]]} visitas a boxes
+    raceControl = Signal(object)      # [dict] mensajes de dirección de carrera (lista completa)
+    sessionClock = Signal(object)     # (t_rel, restante_s, extrapolando) reloj de sesión
+    lapCount = Signal(object)         # (vuelta_actual, total) en carreras
+    sessionMeta = Signal(object)      # {"type", "meeting", "name"} de SessionInfo
     failed = Signal(str)
 
     def set_speed(self, speed: float) -> None:

@@ -119,7 +119,30 @@ class DemoSource(BaseSource):
             (150.0, 24.5, 37.0, 4.2, True),   # chaparrón sintético
             (180.0, 25.5, 39.0, 3.1, False),
         ])
+        self.sessionMeta.emit(
+            {"type": "Race", "meeting": "Demo Grand Prix", "name": "Race"})
+        self.lapCount.emit((1, 20))
+        self.sessionClock.emit((0.0, 2.0 * 3600.0, True))
+        self.raceControl.emit([
+            {"t": 0.0, "lap": 1, "category": "Other", "flag": "GREEN",
+             "scope": "Track", "sector": None, "mode": "", "driver": "",
+             "message": "GREEN LIGHT - PIT EXIT OPEN"},
+            {"t": 60.0, "lap": 2, "category": "Flag", "flag": "YELLOW",
+             "scope": "Sector", "sector": 5, "mode": "", "driver": "",
+             "message": "YELLOW IN TRACK SECTOR 5"},
+            {"t": 90.0, "lap": 2, "category": "Flag", "flag": "CLEAR",
+             "scope": "Sector", "sector": 5, "mode": "", "driver": "",
+             "message": "CLEAR IN TRACK SECTOR 5"},
+            {"t": 200.0, "lap": 3, "category": "SafetyCar", "flag": "",
+             "scope": "Track", "sector": None, "mode": "SAFETY CAR",
+             "driver": "", "message": "SAFETY CAR DEPLOYED"},
+            {"t": 250.0, "lap": 4, "category": "SafetyCar", "flag": "GREEN",
+             "scope": "Track", "sector": None, "mode": "", "driver": "",
+             "message": "SAFETY CAR IN THIS LAP"},
+        ])
         self._pit_log: dict[str, list] = {}
+        self._lane_log: dict[str, list] = {}
+        self._lead_lap = 1
         self.statusChanged.emit(f"Demo running ({len(cars)} cars, x{self.speed:g})")
 
         t_sim = 0.0
@@ -161,7 +184,16 @@ class DemoSource(BaseSource):
             if lap == 5:  # todos paran en la vuelta 4 (cambio SOFT→MEDIUM)
                 self._pit_log.setdefault(car.info.number, []).append((4, t))
                 self.pits.emit({k: list(v) for k, v in self._pit_log.items()})
+                # visita sintética a boxes terminando en el cruce (los autos
+                # del demo no frenan: tiempo detenido 0)
+                self._lane_log.setdefault(car.info.number, []).append(
+                    [4, t - 21.5, t - 0.5])
+                self.pitLane.emit({k: [list(v) for v in vs]
+                                   for k, vs in self._lane_log.items()})
             car.prev_lap = lap
+            if lap > self._lead_lap:
+                self._lead_lap = lap
+                self.lapCount.emit((lap, 20))
 
         accel = dv / self.DT
         throttle = 100.0 if accel > 1.0 else (30.0 if abs(accel) <= 1.0 else 0.0)

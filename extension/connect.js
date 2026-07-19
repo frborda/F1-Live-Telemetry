@@ -68,14 +68,22 @@ async function connect() {
       chrome.storage.local.remove("pendingAuth");
       return;
     }
-    // plan B: mostrar el token para el botón "Paste token…" del capturador
+    // plan B: entregar por el protocolo f1telemetry:// (diálogo nativo
+    // "Abrir F1 Live Telemetry") o copiar para "Paste token…"
     const token = extractToken(cookie);
     if (token) {
       $("tokenbox").style.display = "block";
       $("token").value = token;
+      $("openapp").onclick = () => {
+        location.href = "f1telemetry://auth?token=" + encodeURIComponent(token);
+        status.textContent =
+          'If the browser asked to open "F1 Live Telemetry", accept — the ' +
+          "capturer picks the token up automatically.";
+        status.className = "warn";
+      };
       status.textContent =
         "Could not reach the app on localhost (" + lastError.message + "). " +
-        'Copy the token below and use "Paste token…" in the capturer.';
+        'Use "Open in the app", or copy the token below.';
       status.className = "warn";
       return;
     }
