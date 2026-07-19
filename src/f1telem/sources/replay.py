@@ -113,6 +113,7 @@ class ReplaySource(BaseSource):
         self._emit_track_status(session)
         self._emit_weather(session)
         self._emit_sector_yellows(session)
+        self._emit_sector_times(session)
         pos_stream = self._prepare_positions(session)
 
         stream = {
@@ -312,6 +313,34 @@ class ReplaySource(BaseSource):
         except Exception:
             pass
 
+    def _emit_sector_times(self, session) -> None:
+        """Tiempos oficiales por vuelta (S1-S3 y vuelta): el hub ubica con
+        S1/S2 los límites reales de sector y las tablas muestran estos
+        valores exactos en lugar de los interpolados."""
+        try:
+            reports = []
+            columns = (("Sector1Time", 0, 10.0, 180.0),
+                       ("Sector2Time", 1, 10.0, 180.0),
+                       ("Sector3Time", 2, 10.0, 180.0),
+                       ("LapTime", 3, 30.0, 600.0))
+            for _, row in session.laps.iterrows():
+                try:
+                    drv = str(row["DriverNumber"])
+                    lap = int(row["LapNumber"])
+                except (ValueError, TypeError):
+                    continue
+                for col, idx, lo, hi in columns:
+                    val = row.get(col)
+                    if val is None or val != val:  # NaT
+                        continue
+                    secs = float(val.total_seconds())
+                    if lo < secs < hi:
+                        reports.append((drv, lap, idx, secs))
+            if reports:
+                self.sectorTimes.emit(reports)
+        except Exception:
+            pass  # sin tiempos de sector se mantienen los tercios de vuelta
+
     def _emit_outline(self, session) -> None:
         """Trazado del circuito: posiciones de la vuelta más rápida."""
         try:
@@ -351,8 +380,14 @@ class ReplaySource(BaseSource):
         if len(laps):
             starts = laps["LapStartTime"].dt.total_seconds().to_numpy(dtype=np.float64)
             numbers = laps["LapNumber"].to_numpy(dtype=np.int64)
+            # vueltas con parada: el pit lane distorsiona la distancia
+            # integrada, no aportan al largo de vuelta
+            has_pit = np.zeros(len(laps), dtype=bool)
+            for col in ("PitInTime", "PitOutTime"):
+                if col in laps:
+                    has_pit |= laps[col].notna().to_numpy()
             valid = ~np.isnan(starts)
-            starts, numbers = starts[valid], numbers[valid]
+            starts, numbers, has_pit = starts[valid], numbers[valid], has_pit[valid]
             if len(starts):
                 first_lap_starts.append(float(starts[0]))
                 bounds = np.searchsorted(st, starts)
@@ -361,11 +396,14 @@ class ReplaySource(BaseSource):
                     i1 = int(bounds[k + 1]) if k + 1 < len(bounds) else n
                     if i0 >= i1:
                         continue
-                    d0 = dist_total[i0 - 1] if i0 > 0 else 0.0
+                    # base = distancia integrada EN el cruce oficial de meta
+                    # (interpolada); usar la muestra previa corría la línea
+                    # hasta ~20 m antes y sesgaba vuelta y S3 en ~0,25 s
+                    d0 = float(np.interp(starts[k], st, dist_total))
                     lap_no[i0:i1] = numbers[k]
                     base[i0:i1] = d0
-                    if k + 1 < len(bounds) and i1 > i0:
-                        length = float(dist_total[i1 - 1] - d0)
+                    if k + 1 < len(bounds) and not has_pit[k]:
+                        length = float(np.interp(starts[k + 1], st, dist_total) - d0)
                         if 1000.0 < length < 30000.0:
                             lap_lengths.append(length)
 

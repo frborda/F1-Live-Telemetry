@@ -8,8 +8,8 @@ from PySide6.QtGui import QColor, QPainter, QPixmap, QPolygonF, QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QSlider, QSpinBox, QSplitter, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QSlider, QSpinBox, QSplitter,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .. import __version__, config
@@ -18,6 +18,7 @@ from ..models import CHANNELS, CHANNEL_ORDER
 from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplaySource
 from . import theme
 from .charts import RollingChart, WrapChart
+from .docks import Detachable
 from .qualy_view import QualyView
 from .timing_view import TimingView, fmt_laptime
 from .tower import TimingTower
@@ -189,7 +190,7 @@ class MainWindow(QMainWindow):
         self.chart_timing = TimingView(self.hub, self.cfg)
         self.charts = [self.chart_rolling, self.chart_wrap, self.chart_qualy, self.chart_timing]
         self.track_map = TrackMapView(self.hub)
-        self.tower = TimingTower(self.hub)
+        self.tower = TimingTower(self.hub, self.cfg)
         self._tick_n = 0
 
         self._build_ui()
@@ -209,6 +210,20 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(
                 3000, lambda: run_check(self, self.cfg, silent=True)
             )
+
+        # restaurar la disposición guardada de la ventana y los divisores
+        ui = self.cfg.get("ui", {})
+        geom = ui.get("win_geom")
+        if isinstance(geom, list) and len(geom) == 4:
+            self.setGeometry(*[int(v) for v in geom])
+        if ui.get("win_max"):
+            self.setWindowState(Qt.WindowMaximized)
+        for key, split in (("split_main", self.splitter),
+                           ("split_right", self.right_split)):
+            sizes = ui.get(key)
+            if isinstance(sizes, list) and sizes and all(
+                    isinstance(v, (int, float)) for v in sizes):
+                split.setSizes([int(v) for v in sizes])
 
     # ------------------------------------------------------------------- UI
 
@@ -257,7 +272,8 @@ class MainWindow(QMainWindow):
 
         self.connect_btn = QPushButton("Connect")
         src_lay.addWidget(self.connect_btn)
-        side.addWidget(src_box)
+        self.source_panel = Detachable("source", "Data source", src_box)
+        side.addWidget(self.source_panel)
 
         # --- pilotos ---
         drv_box = QGroupBox("Drivers (chart series)")
@@ -267,7 +283,8 @@ class MainWindow(QMainWindow):
         self.driver_list = QListWidget()
         self.driver_list.setMinimumHeight(180)
         drv_lay.addWidget(self.driver_list)
-        side.addWidget(drv_box, stretch=1)
+        self.drivers_panel = Detachable("drivers", "Drivers", drv_box)
+        side.addWidget(self.drivers_panel, stretch=1)
 
         # --- modo y canal ---
         mode_box = QGroupBox("Mode")
@@ -281,22 +298,24 @@ class MainWindow(QMainWindow):
         self.window_combo = QComboBox()
         for label, laps in X_WINDOWS:
             self.window_combo.addItem(label, laps)
-        self.map_check = QCheckBox("Show track map")
-        self.map_check.setChecked(bool(self.cfg["ui"].get("show_map", True)))
         self.trails_check = QCheckBox("Map trails")
         self.trails_check.setChecked(bool(self.cfg["ui"].get("show_trails", True)))
-        self.tower_check = QCheckBox("Timing tower")
-        self.tower_check.setChecked(bool(self.cfg["ui"].get("show_tower", True)))
         self.peaks_check = QCheckBox("Peak values (max/min)")
         self.peaks_check.setChecked(bool(self.cfg["ui"].get("show_peaks", False)))
+        self.panels_btn = QPushButton("Panels…")
+        self.panels_btn.setToolTip(
+            "Choose which panels to show in this mode; each panel can also\n"
+            "be detached into its own window from its ⧉ button"
+        )
         mode_lay.addRow("Mode", self.mode_combo)
         mode_lay.addRow("Channel", self.channel_combo)
         mode_lay.addRow("X window", self.window_combo)
-        mode_lay.addRow(self.map_check)
         mode_lay.addRow(self.trails_check)
-        mode_lay.addRow(self.tower_check)
         mode_lay.addRow(self.peaks_check)
-        side.addWidget(mode_box)
+        mode_lay.addRow(self.panels_btn)
+        # el panel Mode lleva el botón Panels…: se puede flotar pero no ocultar
+        self.mode_panel = Detachable("mode", "Mode", mode_box, closable=False)
+        side.addWidget(self.mode_panel)
 
         # --- referencia de qualy ---
         self.ref_box = QGroupBox("Quali: target lap")
@@ -311,8 +330,10 @@ class MainWindow(QMainWindow):
         ref_lay.addRow("Driver", self.ref_driver_combo)
         ref_lay.addRow("Lap", self.ref_lap_combo)
         ref_lay.addRow(ref_btns)
-        self.ref_box.setVisible(False)
-        side.addWidget(self.ref_box)
+        self.ref_panel = Detachable("quali_ref", "Quali target", self.ref_box,
+                                    closable=False)
+        self.ref_panel.apply_visible(False)
+        side.addWidget(self.ref_panel)
 
         side_widget = QWidget()
         side_widget.setLayout(side)
@@ -320,12 +341,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(side_widget)
 
         self.stack = QStackedWidget()
-        for chart in self.charts:
-            self.stack.addWidget(chart)
-        # panel derecho: torre arriba, mapa debajo
+        self.chart_panels: list[Detachable] = []
+        chart_meta = [
+            ("race_chart", "Race chart"),
+            ("race2_chart", "Race 2 chart"),
+            ("quali_view", "Quali comparison"),
+            ("times_gap", "Times / Gap"),
+        ]
+        for chart, (pid, title) in zip(self.charts, chart_meta):
+            holder = Detachable(pid, title, chart, keep_placeholder=True)
+            self.chart_panels.append(holder)
+            self.stack.addWidget(holder)
+        # panel derecho: torre arriba, mapa debajo (ambos desacoplables)
+        self.tower_panel = Detachable("tower", "Timing tower", self.tower)
+        self.map_panel = Detachable("map", "Track map", self.track_map)
         self.right_split = QSplitter(Qt.Vertical)
-        self.right_split.addWidget(self.tower)
-        self.right_split.addWidget(self.track_map)
+        self.right_split.addWidget(self.tower_panel)
+        self.right_split.addWidget(self.map_panel)
         self.right_split.setStretchFactor(0, 1)
         self.right_split.setStretchFactor(1, 1)
         self.right_split.setMinimumWidth(300)
@@ -335,12 +367,7 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setCollapsible(1, False)
-        self.splitter.setSizes([950, 340])
-        self.track_map.setVisible(self.map_check.isChecked())
-        self.tower.setVisible(self.tower_check.isChecked())
-        self.right_split.setVisible(
-            self.map_check.isChecked() or self.tower_check.isChecked()
-        )
+        self.splitter.setSizes([810, 480])
 
         # línea de tiempo del replay: avanzar/retroceder en toda la tanda
         center = QWidget()
@@ -371,9 +398,26 @@ class MainWindow(QMainWindow):
         seek_lay.addLayout(mid, stretch=1)
         self.time_label = QLabel("0:00 / 0:00")
         seek_lay.addWidget(self.time_label)
-        self.seek_row.setVisible(False)
-        center_lay.addWidget(self.seek_row)
+        self.timeline_panel = Detachable("timeline", "Timeline", self.seek_row,
+                                         closable=False)
+        self.timeline_panel.apply_visible(False)
+        self._timeline_on = False
+        center_lay.addWidget(self.timeline_panel)
         layout.addWidget(center, stretch=1)
+
+        self._panels = {
+            "tower": self.tower_panel,
+            "map": self.map_panel,
+            "times_tables": self.chart_timing.tables_panel,
+            "quali_cards": self.chart_qualy.cards_panel,
+            "source": self.source_panel,
+            "drivers": self.drivers_panel,
+            "mode": self.mode_panel,
+            "quali_ref": self.ref_panel,
+            "timeline": self.timeline_panel,
+        }
+        for holder in self.chart_panels:
+            self._panels[holder.panel_id] = holder
 
         self.setCentralWidget(root)
         self.status_label = QLabel(self._source_status)
@@ -400,17 +444,19 @@ class MainWindow(QMainWindow):
                       self.chart_qualy.chart, self.chart_timing):
             chart.hover_dist_cb = self._on_chart_hover
         self.track_map.hover_dist_cb = self._on_map_hover
-        self.map_check.toggled.connect(self._map_toggled)
         self.trails_check.toggled.connect(self._trails_toggled)
         self.track_map.set_trails_enabled(self.trails_check.isChecked())
         self.peaks_check.toggled.connect(self._peaks_toggled)
+        self.panels_btn.clicked.connect(self._show_panels_menu)
+        for panel in self._panels.values():
+            panel.stateChanged.connect(self._on_panel_state)
+        self._restore_panels()
         self.all_check.toggled.connect(self._select_all_toggled)
         self.window_combo.currentIndexChanged.connect(self._window_changed)
         self.seek_slider.sliderReleased.connect(self._seek_released)
         self.pause_btn.toggled.connect(self._pause_toggled)
         self.live_btn.clicked.connect(self._go_live)
         self.speed_combo.currentIndexChanged.connect(self._speed_changed)
-        self.tower_check.toggled.connect(self._tower_toggled)
         if self.peaks_check.isChecked():
             self._peaks_toggled(True)
         # aplicar las ventanas guardadas y reflejar la del modo activo
@@ -482,6 +528,11 @@ class MainWindow(QMainWindow):
         source.trackStatus.connect(self._on_track_status)
         source.weather.connect(self._on_weather)
         source.sectorYellows.connect(self.hub.on_sector_yellows)
+        source.sectorTimes.connect(self.hub.on_sector_times)
+        source.segmentStatus.connect(self.hub.on_segments)
+        # Live/Capture: el marco de vuelta llega con la latencia del feed y
+        # se re-ancla con los S1 oficiales
+        self.hub.live_frames = isinstance(source, (LiveSource, CaptureSource))
         self.lap_ruler.set_rain([])
         self._progress = None
         self.lap_ruler.set_marks([])
@@ -493,9 +544,9 @@ class MainWindow(QMainWindow):
             source.progress.connect(self._on_progress)
             source.seekReset.connect(self._on_seek_reset)
             source.lapMarks.connect(self.lap_ruler.set_marks)
-            self.seek_row.setVisible(True)
+            self._set_timeline_available(True)
         else:
-            self.seek_row.setVisible(False)
+            self._set_timeline_available(False)
         self.live_btn.setVisible(isinstance(source, CaptureSource))
         if isinstance(source, CaptureSource):
             source.liveChanged.connect(self._on_live_changed)
@@ -520,7 +571,7 @@ class MainWindow(QMainWindow):
         source.deleteLater()
         self.connect_btn.setText("Connect")
         self.source_combo.setEnabled(True)
-        self.seek_row.setVisible(False)
+        self._set_timeline_available(False)
         self.live_btn.setVisible(False)
         self._on_source_status("Disconnected. Received data remains available.")
 
@@ -531,7 +582,7 @@ class MainWindow(QMainWindow):
             source.deleteLater()
             self.connect_btn.setText("Connect")
             self.source_combo.setEnabled(True)
-            self.seek_row.setVisible(False)
+            self._set_timeline_available(False)
             self.live_btn.setVisible(False)
 
     # ------------------------------------------------- línea de tiempo
@@ -732,7 +783,7 @@ class MainWindow(QMainWindow):
 
     def _mode_changed(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
-        self.ref_box.setVisible(index == 2)
+        self._set_ref_available(index == 2)
         if index == 2:
             self._refresh_ref_laps()
         self._sync_window_combo()
@@ -813,27 +864,93 @@ class MainWindow(QMainWindow):
             return
         self.chart_qualy.set_reference(drv, int(lap))
 
-    def _map_toggled(self, on: bool) -> None:
-        self.track_map.setVisible(on)
-        self.cfg.setdefault("ui", {})["show_map"] = on
-        config.save_config(self.cfg)
-        self._sync_right_panel()
-
     def _trails_toggled(self, on: bool) -> None:
         self.track_map.set_trails_enabled(on)
         self.cfg.setdefault("ui", {})["show_trails"] = on
         config.save_config(self.cfg)
 
-    def _tower_toggled(self, on: bool) -> None:
-        self.tower.setVisible(on)
-        self.cfg.setdefault("ui", {})["show_tower"] = on
+    # ------------------------------------------------------------- paneles
+
+    # visibilidad global elegida por el usuario (independiente del modo);
+    # quali_ref y timeline se auto-administran y los centrales acoplados son
+    # la página de su modo
+    _PERSIST_VISIBLE = ("tower", "map", "times_tables", "quali_cards",
+                        "source", "drivers", "mode")
+
+    def _show_panels_menu(self) -> None:
+        """Menú de paneles: mostrar/ocultar cada uno (con ⧉ en la barrita de
+        cada panel se desacopla a una ventana propia)."""
+        menu = QMenu(self)
+        auto = {h.panel_id for h in self.chart_panels} | {"quali_ref", "timeline"}
+        for pid, panel in self._panels.items():
+            if pid in auto and not panel.floating:
+                continue  # acoplado se administra solo: nada que elegir
+            action = menu.addAction(
+                panel.title + ("  (floating)" if panel.floating else "")
+            )
+            action.setCheckable(True)
+            action.setChecked(panel.is_panel_visible())
+            action.toggled.connect(
+                lambda on, p=panel: p.set_panel_visible(on)
+            )
+        menu.exec(self.panels_btn.mapToGlobal(self.panels_btn.rect().bottomLeft()))
+
+    def _set_timeline_available(self, on: bool) -> None:
+        """La línea de tiempo aplica solo a replay/captura; acoplada se
+        colapsa cuando no hay, flotante queda la ventana vacía."""
+        self._timeline_on = on
+        self.seek_row.setVisible(on)
+        if not self.timeline_panel.floating:
+            self.timeline_panel.apply_visible(on)
+
+    def _set_ref_available(self, on: bool) -> None:
+        self.ref_box.setVisible(on)
+        if not self.ref_panel.floating:
+            self.ref_panel.apply_visible(on)
+
+    def _on_panel_state(self) -> None:
+        """Persiste la visibilidad global y el estado flotante de cada panel."""
+        panels_cfg = self.cfg.setdefault("panels", {})
+        float_cfg = panels_cfg.setdefault("float", {})
+        visible = panels_cfg.setdefault("visible", {})
+        for pid, panel in self._panels.items():
+            if panel.floating:
+                float_cfg[pid] = panel.save_state()
+            else:
+                float_cfg.pop(pid, None)
+                if pid in self._PERSIST_VISIBLE:
+                    visible[pid] = panel.is_panel_visible()
         config.save_config(self.cfg)
+        # tras acoplar/desacoplar, reaplicar la disponibilidad automática
+        self._set_timeline_available(self._timeline_on)
+        self._set_ref_available(self.mode_combo.currentIndex() == 2)
+        self._sync_right_panel()
+
+    def _restore_panels(self) -> None:
+        """Restaura la disposición guardada tal cual: visibilidad global y
+        paneles flotantes con su geometría y fijado."""
+        panels_cfg = self.cfg.get("panels", {})
+        visible = panels_cfg.get("visible", {})
+        for pid in self._PERSIST_VISIBLE:
+            self._panels[pid].apply_visible(bool(visible.get(pid, True)))
+        # copia: restore_state dispara stateChanged -> _on_panel_state, que
+        # reescribe este mismo dict mientras se itera
+        for pid, state in list(panels_cfg.get("float", {}).items()):
+            panel = self._panels.get(pid)
+            if panel is not None:
+                panel.restore_state(state)
+        if isinstance(panels_cfg, dict):  # claves del esquema por-modo viejo
+            panels_cfg.pop("mode_visible", None)
+            panels_cfg.pop("views", None)
+        self._set_timeline_available(self._timeline_on)
+        self._set_ref_available(self.mode_combo.currentIndex() == 2)
         self._sync_right_panel()
 
     def _sync_right_panel(self) -> None:
-        self.right_split.setVisible(
-            self.map_check.isChecked() or self.tower_check.isChecked()
-        )
+        self.right_split.setVisible(any(
+            not p.floating and p.is_panel_visible()
+            for p in (self.tower_panel, self.map_panel)
+        ))
 
     def _pause_toggled(self, on: bool) -> None:
         if self.source is not None:
@@ -854,12 +971,28 @@ class MainWindow(QMainWindow):
 
     def _tick(self) -> None:
         self._tick_n += 1
-        chart = self.charts[self.stack.currentIndex()]
-        chart.refresh()
+        if self._tick_n % 30 == 0:  # 1 Hz: límites oficiales de sector
+            self.hub.maybe_derive_sector_bounds()
+        cur = self.stack.currentIndex()
+        self.charts[cur].refresh()
+        # gráficos centrales flotantes: siguen vivos en cualquier modo
+        for i, holder in enumerate(self.chart_panels):
+            if i != cur and holder.floating and holder.is_panel_visible():
+                self.charts[i].refresh()
         if self.track_map.isVisible():
             self.track_map.refresh()
         if self.tower.isVisible() and self._tick_n % 15 == 0:
             self.tower.refresh()
+        if self._tick_n % 15 == 0:
+            # sub-paneles flotantes de vistas no activas (y no flotantes)
+            tables = self.chart_timing.tables_panel
+            if (cur != 3 and not self.chart_panels[3].floating
+                    and tables.floating and tables.is_panel_visible()):
+                self.chart_timing.refresh_tables()
+            cards = self.chart_qualy.cards_panel
+            if (cur != 2 and not self.chart_panels[2].floating
+                    and cards.floating and cards.is_panel_visible()):
+                self.chart_qualy._update_cards()
         meta = f"Lap: {self.hub.track_length:,.0f} m  ·  Samples: {self.hub.total_samples:,}"
         weather = self.hub.weather_at(self.hub.latest_t)
         if weather is not None:
@@ -870,5 +1003,20 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._disconnect()
+        self._on_panel_state()  # persiste la geometría flotante actual
+        for panel in self._panels.values():
+            panel.close_float()
+        self._timer.stop()
+        self._laps_timer.stop()
+        ui = self.cfg.setdefault("ui", {})
+        ui["win_max"] = self.isMaximized()
+        g = self.normalGeometry()
+        ui["win_geom"] = [g.x(), g.y(), g.width(), g.height()]
+        # con un lado colapsado el splitter reporta 0: no pisar lo guardado
+        for key, split in (("split_main", self.splitter),
+                           ("split_right", self.right_split)):
+            sizes = split.sizes()
+            if all(v > 0 for v in sizes):
+                ui[key] = sizes
         config.save_config(self.cfg)
         super().closeEvent(event)

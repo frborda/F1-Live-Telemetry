@@ -34,14 +34,17 @@ DEFAULTS = {
     "ui": {
         "gap_window_laps": 0.0,      # ventana X del gráfico de gap en vueltas (0 = todo)
         "carrera_window_laps": 1.0,  # ventana X del modo Carrera en vueltas (0 = todo)
-        "show_map": True,            # panel del mapa del circuito visible
         "show_trails": True,         # estelas de los autos en el mapa
-        "show_tower": True,          # torre de tiempos visible
         "show_peaks": False,         # valores en texto sobre picos máx/mín
+        "tower_scale": 1.0,          # escala de fuente de la torre (A+/A−)
     },
     "updates": {
         "check_on_startup": True,    # buscar nuevas versiones al abrir
         "skip_version": "",          # versión que el usuario eligió omitir
+    },
+    "panels": {
+        "visible": {},  # global, independiente del modo: {panel: visible}
+        "float": {},    # estado flotante: {panel: {geom, pinned, visible}}
     },
 }
 

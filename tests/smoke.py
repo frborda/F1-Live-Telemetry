@@ -528,27 +528,30 @@ def test_app_demo(app: QApplication) -> None:
     check(len(finite_vals) >= 6, f"velocidades mínimas por curva ({finite_vals[:4]})")
     check(all(40 <= float(v) <= 340 for v in finite_vals), "mínimas por curva plausibles")
 
-    # torre de tiempos
+    # torre de tiempos (estilo broadcast: filas pintadas, modelo en .rows)
     check(win.tower.isVisible(), "torre de tiempos visible")
     win.tower.refresh()
-    check(win.tower.table.rowCount() == 6, f"torre: todos los autos ({win.tower.table.rowCount()})")
-    check(win.tower.table.item(0, 2).text() == "leader", "torre: fila 1 = líder")
-    g2 = win.tower.table.item(1, 2).text()
-    i2 = win.tower.table.item(1, 3).text()
+    rows = win.tower.rows
+    check(len(rows) == 6, f"torre: todos los autos ({len(rows)})")
+    check(rows[0].gap_txt == "leader", "torre: fila 1 = líder")
+    g2, i2 = rows[1].gap_txt, rows[1].int_txt
     check(g2.startswith("+") and i2.startswith("+"), f"torre: gap e intervalo ({g2}, {i2})")
-    last_txt = win.tower.table.item(0, 4).text()
-    best_txt = win.tower.table.item(0, 5).text()
-    check(":" in last_txt and ":" in best_txt,
-          f"torre: última y mejor vuelta ({last_txt}, {best_txt})")
-    pit_txt = win.tower.table.item(0, 6).text()
-    check(pit_txt == "1", f"torre: contador de paradas ({pit_txt})")
-    avg5_txt = win.tower.table.item(0, 7).text()
-    avg10_txt = win.tower.table.item(0, 8).text()
-    check(":" in avg5_txt and ":" in avg10_txt,
-          f"torre: AVG5/AVG10 ({avg5_txt}, {avg10_txt})")
-    headers = [win.tower.table.horizontalHeaderItem(c).text() for c in range(9)]
-    check(headers == ["P", "Driver", "Gap", "Int", "Last", "Best", "Pit", "AVG5", "AVG10"],
-          f"torre: orden de columnas pedido ({headers})")
+    check(math.isfinite(rows[0].last) and math.isfinite(rows[0].best)
+          and rows[0].last_kind > 0,
+          f"torre: última y mejor vuelta ({rows[0].last:.3f}, {rows[0].best:.3f})")
+    check(rows[0].pits == 1, f"torre: contador de paradas ({rows[0].pits})")
+    a5 = win.tower._avg_lap(rows[0].drv, 5)
+    a10 = win.tower._avg_lap(rows[0].drv, 10)
+    check(math.isfinite(a5) and math.isfinite(a10),
+          f"torre: AVG5/AVG10 ({a5:.3f}, {a10:.3f})")
+    check(all(len(r.segs) == 3 and len(r.sectors) == 3 for r in rows),
+          "torre: rayitas y sectores por fila")
+    check(rows[0].gear > 0 and rows[0].speed > 0 and rows[0].rpm > 0,
+          f"torre: telemetría en fila (G{rows[0].gear} · {rows[0].speed:.0f} km/h)")
+    check(any(k > 0 for r in rows for g in r.segs for k in g),
+          "torre: microsectores calculados con estado")
+    check(win.tower.lap_label.text().startswith("LAP"),
+          f"torre: encabezado con vuelta ({win.tower.lap_label.text()!r})")
 
     # pits, banderas y degradación
     check(len(win.hub.pits) == 6, f"pits publicados ({len(win.hub.pits)})")
@@ -600,9 +603,11 @@ def test_app_demo(app: QApplication) -> None:
           f"evento elegido del calendario ({win._selected_gp()})")
     win.gp_combo.setEditText("Bahrain")
     check(win.right_split.orientation() == Qt.Vertical
-          and win.right_split.widget(0) is win.tower
-          and win.right_split.widget(1) is win.track_map,
-          "mapa del circuito debajo de la torre")
+          and win.right_split.widget(0) is win.tower_panel
+          and win.right_split.widget(1) is win.map_panel
+          and win.tower_panel.content is win.tower
+          and win.map_panel.content is win.track_map,
+          "mapa del circuito debajo de la torre (paneles desacoplables)")
 
     # tooltip crosshair: valores de todas las series en el punto del mouse
     from PySide6.QtCore import QPointF
@@ -699,10 +704,93 @@ def test_app_demo(app: QApplication) -> None:
     got_x, got_y = win.hub.positions[drv0].x[-1], win.hub.positions[drv0].y[-1]
     dpos = float(np.hypot(exp_x - got_x, exp_y - got_y))
     check(dpos < 60, f"mapa: posición coherente con la distancia graficada ({dpos:.1f} m)")
-    win.map_check.setChecked(False)
-    check(not mp.isVisible(), "mapa se oculta con el checkbox")
-    win.map_check.setChecked(True)
+    win.map_panel.set_panel_visible(False)
+    check(not mp.isVisible(), "mapa se oculta desde el menú de paneles")
+    win.map_panel.set_panel_visible(True)
     check(mp.isVisible(), "mapa se vuelve a mostrar")
+    check(win.cfg["panels"]["visible"].get("map") is True,
+          "visibilidad de paneles persistida (global, independiente del modo)")
+
+    # desacoplar con el BOTÓN real (clicked(bool) no debe romper detach)
+    win.map_panel.float_btn.click()
+    pump(app, 0.3)
+    check(win.map_panel.floating and win.map_panel._win.isVisible(),
+          "botón ⧉ abre la ventana flotante de inmediato")
+    win.map_panel.attach()
+    pump(app, 0.2)
+
+    # desacoplar / fijar / reacoplar paneles
+    win.tower_panel.detach()
+    pump(app, 0.3)
+    check(win.tower_panel.floating and win.tower.isVisible(),
+          "torre desacoplada en ventana propia")
+    check(not win.tower_panel.isVisible(), "el hueco de la torre se colapsa")
+    win.tower_panel._win.pin_btn.setChecked(True)
+    check(win.tower_panel.pinned, "panel flotante fijado (sin marco, encima)")
+    st = win.tower_panel.save_state()
+    check(st["floating"] and st["pinned"] and len(st["geom"]) == 4,
+          f"estado flotante persistible ({st})")
+    win.tower_panel.attach()
+    pump(app, 0.3)
+    check(not win.tower_panel.floating and win.tower.isVisible()
+          and win.right_split.widget(0) is win.tower_panel,
+          "torre reacoplada en su lugar")
+    tp = win.chart_timing.tables_panel
+    tp.detach()
+    pump(app, 0.3)
+    check(tp.floating and win.chart_timing.tabs.isVisible(),
+          "tablas de Times/Gap flotantes")
+    win.mode_combo.setCurrentIndex(0)   # en otro modo siguen refrescando
+    pump(app, 1.2)
+    check(win.chart_timing.summary_table.rowCount() > 0,
+          "tablas flotantes se refrescan fuera de su modo")
+    tp.attach()
+    pump(app, 0.3)
+    check(not tp.floating, "tablas reacopladas")
+    rc = win.chart_panels[0]
+    rc.detach()
+    pump(app, 0.3)
+    check(rc.floating and win.chart_rolling.isVisible(),
+          "gráfico central desacoplado en ventana propia")
+    check(rc._placeholder is not None and not rc._placeholder.isHidden(),
+          "placeholder con botón de reacople en el centro")
+    win.mode_combo.setCurrentIndex(3)   # flotante sigue refrescando en otro modo
+    pump(app, 0.8)
+    x_rc, _ = win.chart_rolling.curves[sel[0]].getData() if hasattr(
+        win.chart_rolling, "curves") else (None, None)
+    check(rc.floating and win.chart_rolling.isVisible(),
+          "gráfico central flotante vivo en otro modo")
+    win.mode_combo.setCurrentIndex(0)
+    rc.attach()
+    pump(app, 0.3)
+    check(not rc.floating and win.chart_rolling.isVisible()
+          and win.stack.currentWidget() is rc,
+          "gráfico central reacoplado en su modo")
+
+    # paneles laterales y línea de tiempo también desacoplables
+    dp = win.drivers_panel
+    dp.detach()
+    pump(app, 0.3)
+    check(dp.floating and win.driver_list.isVisible(),
+          "selección de pilotos flotante en ventana propia")
+    dp.attach()
+    pump(app, 0.2)
+    check(not dp.floating and win.driver_list.isVisible(),
+          "selección de pilotos reacoplada")
+    check(win.timeline_panel.content is win.seek_row
+          and win.source_panel.content.isVisible()
+          and win.mode_panel.content.isVisible(),
+          "fuente, modo y línea de tiempo envueltos como paneles")
+
+    # torre: tamaño de fuente A+/A−
+    s0 = win.tower.scale
+    win.tower._change_scale(+0.2)
+    check(abs(win.tower.scale - (s0 + 0.2)) < 1e-9
+          and win.tower.row_h == int(38 * win.tower.scale),
+          f"torre: A+ escala fuente y filas (x{win.tower.scale:.1f})")
+    check(abs(win.cfg["ui"].get("tower_scale", 0) - win.tower.scale) < 1e-9,
+          "torre: escala persistida en config")
+    win.tower._change_scale(-0.2)
 
     # cambio de canal (volviendo al modo Carrera, que es el que se refresca)
     win.channel_combo.setCurrentIndex(1)  # acelerador

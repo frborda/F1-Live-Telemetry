@@ -24,6 +24,7 @@ from ..hub import DataHub
 from ..timing import N_MICRO, SECTOR_STEP, TimingAnalyzer
 from . import theme
 from .charts import HoverProbe, QualyChart, series_pens
+from .docks import Detachable
 from .timing_view import _delta_bg, fmt_gap, fmt_laptime, fmt_secs
 
 
@@ -176,7 +177,7 @@ class QualyView(QWidget):
         self._probe = HoverProbe(
             self.delta_plot, self._delta_hover,
             x_format=lambda x: f"{x:,.0f} m",
-            y_format=lambda y: f"{y:+.2f} s",
+            y_format=lambda y: f"{y:+.3f} s",
         )
         layout.addWidget(self.delta_plot, stretch=3)
 
@@ -188,7 +189,8 @@ class QualyView(QWidget):
         self.more_note = QLabel("showing the first 4 drivers")
         self.more_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         self.more_note.setVisible(False)
-        layout.addWidget(cards_box, stretch=3)
+        self.cards_panel = Detachable("quali_cards", "Quali delta cards", cards_box)
+        layout.addWidget(self.cards_panel, stretch=3)
         layout.addWidget(self.more_note)
 
         hub.driversChanged.connect(self._restyle)

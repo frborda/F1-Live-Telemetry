@@ -54,6 +54,30 @@ def decompress_feed(data: str) -> dict:
     return json.loads(raw)
 
 
+def _index_items(obj):
+    """Itera pares (índice, valor): el feed manda dicts {"0": ...} en los
+    diffs y listas en los snapshots iniciales."""
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            try:
+                yield int(key), val
+            except (ValueError, TypeError):
+                continue
+    elif isinstance(obj, list):
+        yield from enumerate(obj)
+
+
+def _parse_time_value(text) -> float:
+    """'26.123' o '1:44.361' -> segundos (0.0 si no parsea)."""
+    try:
+        if ":" in text:
+            m, s = text.split(":", 1)
+            return float(m) * 60.0 + float(s)
+        return float(text)
+    except (ValueError, AttributeError, TypeError):
+        return 0.0
+
+
 class _CarState:
     __slots__ = ("last_t", "last_speed", "dist_total", "lap", "lap_start_dist")
 
@@ -81,6 +105,11 @@ class LiveDecoderMixin:
         self._status_closed: list[tuple[float, float, str]] = []
         self._status_open: tuple[float, str] | None = None
         self._weather_log: list[tuple] = []
+        self._sector_sent: set[tuple[str, int, int]] = set()
+        self._segment_state: dict[tuple[str, int, int], int] = {}
+        # el snapshot inicial trae valores de la vuelta ANTERIOR: no sirven
+        # para atribuir tiempos a la vuelta en curso (los Segments sí)
+        self._in_snapshot = False
 
     # ------------------------------------------------------------- protocolo
 
@@ -88,8 +117,12 @@ class LiveDecoderMixin:
         # respuesta al Subscribe: snapshot inicial de todos los feeds
         snapshot = msg.get("R")
         if isinstance(snapshot, dict):
-            for feed, data in snapshot.items():
-                self._feed(feed, data)
+            self._in_snapshot = True
+            try:
+                for feed, data in snapshot.items():
+                    self._feed(feed, data)
+            finally:
+                self._in_snapshot = False
         for item in msg.get("M", []) or []:
             if item.get("M") == "feed":
                 args = item.get("A") or []
@@ -181,12 +214,60 @@ class LiveDecoderMixin:
         if changed:
             self.driversDiscovered.emit(dict(self._drivers))
 
+    def _report_time(self, out: list, num: str, lap: int, idx: int,
+                     value, lo: float, hi: float) -> None:
+        """Valida y deduplica un tiempo oficial (sector 0-2 o vuelta 3)."""
+        if lap < 1 or not isinstance(value, str) or not value:
+            return
+        key = (num, lap, idx)
+        if key in self._sector_sent:
+            return
+        secs = _parse_time_value(value)
+        if lo < secs < hi:
+            self._sector_sent.add(key)
+            out.append((num, lap, idx, secs))
+
     def _on_timing(self, data) -> None:
         if not isinstance(data, dict):
             return
+        sector_reports: list[tuple] = []
+        seg_updates: list[tuple] = []
         for num, line in (data.get("Lines") or {}).items():
-            if isinstance(line, dict) and isinstance(line.get("NumberOfLaps"), int):
+            if not isinstance(line, dict):
+                continue
+            if isinstance(line.get("NumberOfLaps"), int):
                 self._laps_done[num] = line["NumberOfLaps"]
+            done = self._laps_done.get(num, 0)
+            # tiempo oficial de la vuelta recién cerrada (formato "1:44.361")
+            if not self._in_snapshot:
+                last = line.get("LastLapTime")
+                if isinstance(last, dict):
+                    self._report_time(sector_reports, num, done, 3,
+                                      last.get("Value"), 30.0, 600.0)
+            for s_idx, sector in _index_items(line.get("Sectors")):
+                if not isinstance(sector, dict):
+                    continue
+                # tiempos oficiales de sector: S1/S2 llegan a mitad de vuelta
+                # (vuelta en curso); S3 cierra la vuelta recién completada
+                if s_idx in (0, 1, 2) and not self._in_snapshot:
+                    lap = done if s_idx == 2 else done + 1
+                    self._report_time(sector_reports, num, lap, s_idx,
+                                      sector.get("Value"), 10.0, 180.0)
+                # estado de los microsectores oficiales (rayitas de colores)
+                for g_idx, seg in _index_items(sector.get("Segments")):
+                    if not isinstance(seg, dict):
+                        continue
+                    status = seg.get("Status")
+                    if not isinstance(status, int):
+                        continue
+                    skey = (num, s_idx, g_idx)
+                    if self._segment_state.get(skey) != status:
+                        self._segment_state[skey] = status
+                        seg_updates.append((num, s_idx, g_idx, status))
+        if sector_reports:
+            self.sectorTimes.emit(sector_reports)
+        if seg_updates:
+            self.segmentStatus.emit(seg_updates)
 
     def _on_position(self, data) -> None:
         if not isinstance(data, dict):
@@ -364,11 +445,15 @@ class LiveSource(LiveDecoderMixin, BaseSource):
         if not isinstance(result, dict):
             return
         self._record_line({"R": result})
-        for topic, data in result.items():
-            try:
-                self._feed(topic, data)
-            except Exception:
-                pass
+        self._in_snapshot = True
+        try:
+            for topic, data in result.items():
+                try:
+                    self._feed(topic, data)
+                except Exception:
+                    pass
+        finally:
+            self._in_snapshot = False
 
     def _on_ws_feed(self, msg) -> None:
         if not isinstance(msg, list) or len(msg) < 2:

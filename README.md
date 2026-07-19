@@ -66,6 +66,23 @@ follows the most recent capture file.
 
 ## Features
 
+- **Detachable panels**: every panel — timing tower, track map, Times/Gap
+  tables, Quali delta cards, each mode's central view (Race, Race 2,
+  Quali, Times/Gap), data source, driver selection, Mode box and the
+  timeline — has a small title bar with a ⧉ button that pops it out into
+  **its own window**, freely movable and resizable, plus a 📌 **pin**
+  button that makes the floating window frameless, always-on-top and
+  immovable (ideal over a broadcast), and a ⇱ button to dock it back where
+  it was (a floating central view leaves a dock-back placeholder in its
+  mode). The **Panels…** button chooses which panels are visible — the
+  choice is global and independent of the active mode, so **any
+  combination of panels** can be assembled; floating panels stay open
+  across modes and keep refreshing (e.g. the timing tables while watching
+  the Race chart). The whole layout is **persistent**: window geometry,
+  splitters and each panel's docked/floating state, position, size and
+  pinned flag are reapplied exactly as they were on the next start.
+- **Tower font size**: A− / A+ buttons in the tower header scale its font
+  and row heights (persisted).
 - **Pause and hot speed change** (demo/replay): the ⏸ button next to the
   timeline pauses/resumes, and the speed selector can be changed at any
   moment without reconnecting.
@@ -76,11 +93,18 @@ follows the most recent capture file.
   mark jumps straight to that lap. Pit stops show as diamonds (driver color),
   flag/SC periods as colored bands and rain as a thin blue stripe. The
   timeline stays active after the replay ends so you can seek back.
-- **Timing tower** (right panel, above the map): every car ordered by track
-  position, with gap to the leader (or "+nL" when lapped), interval to the
-  car ahead, last lap, best lap (green = personal best, purple = session
-  best), pit-stop count and **AVG5/AVG10** (average of the last 5/10 laps,
-  excluding pit in/out laps). Gaps only compute with real positions: at the
+- **Timing tower** (right panel, above the map): broadcast-style rows —
+  position and driver code on the team color, positions gained/lost, DRS
+  status, gear/RPM/speed, **LAST/BEST pills** (purple = session best,
+  green = personal best), interval to the car ahead and gap to the leader
+  (or "+nL" when lapped), plus the **mini-sector dashes** with the sector
+  times below (official feed segments when live; computed against personal
+  and session bests elsewhere). Each row also shows the pit-stop count
+  ("P n" next to the interval) and an **AVG5/AVG10** column (average of the
+  last 5/10 laps, excluding pit in/out laps). The header shows the leader's
+  lap, a track-status badge and the weather. Narrow panels drop the outer
+  blocks first — widen the splitter to see everything. Gaps only compute
+  with real positions: at the
   start, telemetry does not know each car's exact grid slot, so gaps begin at
   the end of sector 1 of lap 1 — the first fixed point common to all cars —
   using a grid offset estimated by projecting car positions onto the track.
@@ -95,10 +119,15 @@ follows the most recent capture file.
   compound, adds the tyre age in parentheses and marks pit-stop laps with
   "P".
 - **Flags and Safety Car**: background bands on the gap chart and the
-  timeline, and a banner on the tower while yellow/SC/VSC/red is active.
+  timeline, and the tower's header badge while yellow/SC/VSC/red is active.
   While a marshal sector is under yellow flag, that stretch of the **track
   map is painted yellow** (replay: race control messages + Fast-F1 marshal
   sectors).
+- **Official mini-sectors** (Times/Gap → "Official µ" tab): the colored
+  dashes of the official timing feed, per driver and in track order —
+  purple = session best, green = personal best, yellow = completed without
+  improving, blue = pit lane. Carried by the Live and Capture sources
+  (existing capture files already contain them).
 - **Real corners** ("Corners" tab): minimum speed at each numbered corner of
   the circuit (T1, T2, … from Fast-F1 `circuit_info`), rolling over the
   current lap and colored against the reference; corners are also labelled on
@@ -171,6 +200,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python tests\smoke.py         # full app with the demo source + live decoder
 .venv\Scripts\python tests\replay_check.py  # real Fast-F1 integration (downloads data)
 .venv\Scripts\python tests\updater_check.py # updater: versions, zip layout, install script
+.venv\Scripts\python tests\sector_bounds_check.py # official sectors: decode, bounds, anchoring
 ```
 
 ## Technical notes
@@ -180,10 +210,24 @@ $env:QT_QPA_PLATFORM = "offscreen"
   from Fast-F1 data).
 - Lap/sector/microsector times are interpolated from the crossing instant of
   24 distance marks per lap. With ~4-5 Hz telemetry the accuracy is about
-  ±0.1 s — good for comparisons, not official timing — and "sectors" are
-  distance thirds of the lap (not the official ones). The gap between cars is
-  the time difference when passing the same track position, with each lap
-  anchored to its own finish-line crossing.
+  ±0.1 s — good for comparisons, not official timing. When official sector
+  times are available (replay: Fast-F1 laps; live/capture: the timing feed),
+  the app locates the **real S1/S2 boundaries** on track — interpolating
+  where each car was at the instant it set each sector time, median across
+  laps and drivers — and anchors the marks to them; each microsector is 1/8
+  of its sector. Each lap's marks are also scaled to the length it really
+  integrated between finish-line crossings. On top of that, **as soon as
+  each official sector/lap time is published, the tables show that exact
+  value** — interpolation only covers what is not timed yet (the rolling
+  current lap and microsectors). In replay all timed laps therefore match
+  the official timing to the millisecond (verified against a full
+  qualifying: 22/22 classification positions identical); live, official
+  values arrive seconds after each crossing, and the official S1 is also
+  used to re-anchor each lap's frame, cutting the error the feed latency
+  introduces in the interpolated values. Without official sector times,
+  sectors fall back to distance thirds of the lap. The gap between cars is the time difference
+  when passing the same track position, with each lap anchored to its own
+  finish-line crossing.
 - Fast-F1 cache: `%LOCALAPPDATA%\f1telem\cache`. Settings:
   `%APPDATA%\f1telem\config.json`.
 

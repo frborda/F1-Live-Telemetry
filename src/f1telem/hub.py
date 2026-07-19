@@ -6,6 +6,7 @@ refresco, así no hacen falta locks.
 """
 from __future__ import annotations
 
+import time
 from collections import deque
 
 import numpy as np
@@ -128,6 +129,19 @@ class DataHub(QObject):
         self.track_status: list[tuple[float, float, str]] = []
         self.weather: list[tuple[float, float, float, float, bool]] = []
         self.sector_yellows: list[tuple[float, float, float, float]] = []
+        # límites oficiales de sector (fin de S1, fin de S2) en metros de
+        # vuelta, derivados de los tiempos de sector del feed / FastF1
+        self.sector_bounds: tuple[float, float] | None = None
+        # tiempos oficiales por (driver, vuelta): [S1, S2, S3, vuelta]
+        self.official_times: dict[tuple[str, int], list[float]] = {}
+        # True cuando el marco de vuelta viene del feed con latencia
+        # (Live/Capture): habilita el re-anclaje con el S1 oficial
+        self.live_frames = False
+        self._bounds_next_try = 0.0
+        self._bounds_done = False
+        # estado de los microsectores oficiales: {driver: {(sector, µ): estado}}
+        self.segments: dict[str, dict[tuple[int, int], int]] = {}
+        self.segment_counts: dict[int, int] = {}
         self.latest_t = 0.0
         self._dist_map = None
         self._dist_map_len = -1
@@ -142,13 +156,16 @@ class DataHub(QObject):
 
     def clear_samples(self) -> None:
         """Vacía las muestras conservando pilotos, trazado y largo de vuelta
-        (para saltos de tiempo del replay: la selección no se pierde)."""
+        (para saltos de tiempo del replay: la selección no se pierde). Los
+        límites de sector ya derivados también se conservan; el estado de los
+        microsectores oficiales se rearma con la historia re-emitida."""
         self.buffers.clear()
         self.positions.clear()
         self.total_samples = 0
         self.latest_t = 0.0
         self._lap_len_obs.clear()
         self._lap1_offsets.clear()
+        self.segments.clear()
 
     def on_corners(self, corners) -> None:
         self.corners = list(corners)
@@ -167,6 +184,102 @@ class DataHub(QObject):
 
     def on_sector_yellows(self, periods) -> None:
         self.sector_yellows = list(periods)
+
+    def on_sector_times(self, batch) -> None:
+        """Tiempos oficiales: [(driver, vuelta, índice, segundos)] con
+        índice 0-2 = S1-S3 y 3 = vuelta. Gana el primer valor (una
+        atribución tardía dudosa no pisa un dato ya correcto)."""
+        for drv, lap, idx, secs in batch:
+            if idx not in (0, 1, 2, 3):
+                continue
+            rec = self.official_times.setdefault(
+                (str(drv), int(lap)), [float("nan")] * 4
+            )
+            if rec[idx] != rec[idx]:  # NaN: aún sin valor
+                rec[idx] = float(secs)
+
+    def on_segments(self, batch) -> None:
+        """Estados de microsectores oficiales: [(driver, sector, µ, estado)]."""
+        for drv, sec, seg, status in batch:
+            sec, seg = int(sec), int(seg)
+            self.segments.setdefault(str(drv), {})[(sec, seg)] = int(status)
+            if seg + 1 > self.segment_counts.get(sec, 0):
+                self.segment_counts[sec] = seg + 1
+
+    # ---- límites oficiales de sector ----
+
+    BOUNDS_MIN_OBS = 6     # observaciones mínimas por límite para publicarlo
+    BOUNDS_DONE_OBS = 400  # con estas observaciones se considera convergido
+
+    def _lap_t0(self, buf: SeriesBuffer, lap: int) -> float | None:
+        """Instante del cruce de meta que abre la vuelta (interpolado entre
+        la última muestra de la vuelta previa y la primera de esta)."""
+        lapcol = buf.col("lap")
+        i0 = int(np.searchsorted(lapcol, lap, side="left"))
+        if i0 <= 0 or i0 >= buf.n or int(lapcol[i0 - 1]) != lap - 1:
+            return None
+        d_prev = float(buf.col("dist_lap")[i0 - 1]) - self.track_length
+        d_next = float(buf.col("dist_lap")[i0])
+        t_prev = float(buf.col("t")[i0 - 1])
+        t_next = float(buf.col("t")[i0])
+        if d_prev >= 0.0 or d_next <= d_prev or t_next < t_prev:
+            # la vuelta previa integró de más: el cruce cayó entre muestras
+            return (t_prev + t_next) / 2.0
+        return t_prev + (0.0 - d_prev) / (d_next - d_prev) * (t_next - t_prev)
+
+    def maybe_derive_sector_bounds(self) -> None:
+        """Ubica los límites reales de S1/S2 en metros: interpola dónde
+        estaba cada auto en el instante en que cerró el sector (ancla = cruce
+        de meta + tiempo oficial de sector) y toma la mediana entre vueltas y
+        pilotos. Llamar periódicamente; recalcula como mucho cada 5 s y deja
+        de hacerlo al converger."""
+        if self._bounds_done or not self.official_times:
+            return
+        now = time.monotonic()
+        if now < self._bounds_next_try:
+            return
+        self._bounds_next_try = now + 5.0
+        L = self.track_length
+        b1_obs: list[float] = []
+        b2_obs: list[float] = []
+        for (drv, lap), (s1, s2, _s3, _lt) in self.official_times.items():
+            if lap < 2:
+                continue  # vuelta 1: largada desde la grilla, sin ancla limpia
+            buf = self.buffers.get(drv)
+            if buf is None or not buf.n:
+                continue
+            t0 = self._lap_t0(buf, lap)
+            if t0 is None:
+                continue
+            sl = buf.lap_slice(lap)
+            t_arr = sl["t"]
+            d_arr = sl["dist_lap"]
+            if len(t_arr) < 4:
+                continue
+            if s1 == s1:  # not NaN
+                tc = t0 + s1
+                if t_arr[0] <= tc <= t_arr[-1]:
+                    d1 = float(np.interp(tc, t_arr, d_arr))
+                    if 0.10 * L < d1 < 0.55 * L:
+                        b1_obs.append(d1)
+                if s2 == s2:
+                    tc = t0 + s1 + s2
+                    if t_arr[0] <= tc <= t_arr[-1]:
+                        d2 = float(np.interp(tc, t_arr, d_arr))
+                        if 0.40 * L < d2 < 0.92 * L:
+                            b2_obs.append(d2)
+        if len(b1_obs) < self.BOUNDS_MIN_OBS or len(b2_obs) < self.BOUNDS_MIN_OBS:
+            return
+        b1 = float(np.median(b1_obs))
+        b2 = float(np.median(b2_obs))
+        if not (0.0 < b1 < b2 - 0.05 * L and b2 < L):
+            return
+        if len(b1_obs) + len(b2_obs) >= self.BOUNDS_DONE_OBS:
+            self._bounds_done = True
+        if (self.sector_bounds is None
+                or abs(b1 - self.sector_bounds[0]) > 2.0
+                or abs(b2 - self.sector_bounds[1]) > 2.0):
+            self.sector_bounds = (b1, b2)
 
     def weather_at(self, t: float):
         """Última lectura de clima anterior o igual a t (None si no hay)."""
@@ -188,6 +301,13 @@ class DataHub(QObject):
         self.track_status = []
         self.weather = []
         self.sector_yellows = []
+        self.sector_bounds = None
+        self.official_times.clear()
+        self.live_frames = False
+        self._bounds_next_try = 0.0
+        self._bounds_done = False
+        self.segments.clear()
+        self.segment_counts.clear()
         self.latest_t = 0.0
         self.outline = None
         self._dist_map = None

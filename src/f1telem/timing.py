@@ -2,9 +2,12 @@
 microsectores y gaps. Funciona igual para las tres fuentes.
 
 Método: se interpola el instante en que cada auto cruza marcas de
-distancia fijas dentro de la vuelta (24 divisiones iguales; los sectores
-son grupos de 8). Con telemetría a ~4-5 Hz la precisión es de ~±0,1 s:
-sirve para comparar, no es el cronometraje oficial.
+distancia fijas dentro de la vuelta (24 divisiones; los sectores son
+grupos de 8). Si el hub ya derivó los límites oficiales de sector
+(`hub.sector_bounds`), las marcas se anclan a ellos: S1/S2/S3 pasan a ser
+los sectores reales y cada µsector es 1/8 de su sector; si no, la vuelta
+se divide en tercios iguales. Con telemetría a ~4-5 Hz la precisión es de
+~±0,1 s: sirve para comparar, no es el cronometraje oficial.
 
 El "gap" entre dos autos es la diferencia de tiempo al pasar por la misma
 posición de pista (vuelta × largo + metro de vuelta): positivo = detrás
@@ -25,25 +28,80 @@ class TimingAnalyzer:
         self.hub = hub
         self._marks_cache: dict[tuple[str, int], np.ndarray] = {}
         self._pos_cache: dict[str, tuple[int, float, tuple]] = {}
-        self._len_used = 0.0
+        self._geo_used: tuple = (0.0, None)
 
     def clear(self) -> None:
         self._marks_cache.clear()
         self._pos_cache.clear()
 
     def _mark_dists(self) -> np.ndarray:
-        return np.linspace(0.0, self.hub.track_length, N_MICRO + 1)
+        """Distancias de las 25 marcas: ancladas a los límites oficiales de
+        sector cuando el hub ya los derivó, si no tercios iguales."""
+        L = self.hub.track_length
+        bounds = self.hub.sector_bounds
+        if bounds is not None:
+            b1, b2 = bounds
+            if 0.0 < b1 < b2 < L:
+                return np.concatenate((
+                    np.linspace(0.0, b1, SECTOR_STEP + 1)[:-1],
+                    np.linspace(b1, b2, SECTOR_STEP + 1)[:-1],
+                    np.linspace(b2, L, SECTOR_STEP + 1),
+                ))
+        return np.linspace(0.0, L, N_MICRO + 1)
 
     def _check_track_len(self) -> None:
-        if abs(self.hub.track_length - self._len_used) > 1.0:
+        geo = (self.hub.track_length, self.hub.sector_bounds)
+        if (abs(geo[0] - self._geo_used[0]) > 1.0
+                or geo[1] != self._geo_used[1]):
             self._marks_cache.clear()
             self._pos_cache.clear()
-            self._len_used = self.hub.track_length
+            self._geo_used = geo
 
     # ------------------------------------------------------- marcas por vuelta
 
     def lap_marks(self, drv: str, lap: int) -> np.ndarray | None:
         """Tiempo de cruce de cada marca de la vuelta (NaN si aún no cruzada).
+
+        En fuentes en vivo (marco de vuelta con latencia del feed) los
+        cruces de meta se re-anclan con el S1 oficial apenas llega: el cruce
+        real es t(b1) − S1, independiente de la latencia del stream.
+        """
+        marks = self._frame_marks(drv, lap)
+        if marks is None or not self.hub.live_frames:
+            return marks
+        t0 = self._s1_crossing(drv, lap)
+        t1 = self._s1_crossing(drv, lap + 1)
+        if t0 is None and t1 is None:
+            return marks
+        marks = marks.copy()
+        if t0 is not None:
+            rest = marks[1:][np.isfinite(marks[1:])]
+            if not len(rest) or t0 < float(rest[0]):
+                marks[0] = t0
+        if t1 is not None:
+            rest = marks[:-1][np.isfinite(marks[:-1])]
+            if not len(rest) or t1 > float(rest[-1]):
+                marks[-1] = t1
+        return marks
+
+    def _s1_crossing(self, drv: str, lap: int) -> float | None:
+        """Cruce de meta re-anclado: instante en que el marco cruza b1 menos
+        el S1 oficial. Requiere los límites oficiales ya derivados."""
+        if self.hub.sector_bounds is None:
+            return None
+        off = self.hub.official_times.get((drv, lap))
+        if off is None or off[0] != off[0]:
+            return None
+        frame = self._frame_marks(drv, lap)
+        if frame is None:
+            return None
+        t_b1 = float(frame[SECTOR_STEP])
+        if t_b1 != t_b1:
+            return None
+        return t_b1 - float(off[0])
+
+    def _frame_marks(self, drv: str, lap: int) -> np.ndarray | None:
+        """Marcas en el marco de distancia de la vuelta (sin re-anclaje).
 
         Los extremos se anclan sintetizando el instante del cruce de meta.
         Sin esto, una vuelta cuya distancia integrada difiere del largo
@@ -67,17 +125,32 @@ class TimingAnalyzer:
         t = buf.col("t")[i0:i1].astype(np.float64)
         completed = lap < buf.current_lap()
 
+        # marco propio de la vuelta: las muestras vecinas se proyectan vía
+        # dist_total (comparte la integración con dist_lap) y, si la vuelta
+        # siguiente ya existe, las marcas se escalan al largo REALMENTE
+        # integrado (base_next − base). Sin esto se asumía que cada vuelta
+        # integró exactamente L y el error de integración (±15 m) sesgaba
+        # los cruces de meta hasta ~0,1 s o dejaba vueltas sin marca final.
+        base = float(buf.col("dist_total")[i0]) - float(d[0])
+        scale = 1.0
+        if i1 < buf.n and int(lapcol[i1]) == lap + 1:
+            base_next = (float(buf.col("dist_total")[i1])
+                         - float(buf.col("dist_lap")[i1]))
+            lap_len = base_next - base
+            if 0.5 * L < lap_len < 1.5 * L:
+                scale = lap_len / L
+
         # ancla inicial: cruce de meta en dist 0
         if d[0] > 0.0:
             anchor = None
             if i0 > 0 and int(lapcol[i0 - 1]) == lap - 1:
-                d_prev = float(buf.col("dist_lap")[i0 - 1]) - L
+                d_prev = float(buf.col("dist_total")[i0 - 1]) - base
                 t_prev = float(buf.col("t")[i0 - 1])
                 if d_prev < 0.0:
                     anchor = (d_prev, t_prev)
                 else:
-                    # la vuelta previa integró de más: el cruce cayó entre
-                    # ambas muestras (error acotado a medio período)
+                    # el marco arranca antes de la muestra previa (raro):
+                    # el cruce cayó entre ambas muestras
                     anchor = (0.0, (t_prev + float(t[0])) / 2.0)
             elif d[0] < L * 0.05:
                 # sin vuelta previa: retro-extrapolar por velocidad
@@ -87,11 +160,15 @@ class TimingAnalyzer:
                 d = np.concatenate(([anchor[0]], d))
                 t = np.concatenate(([anchor[1]], t))
 
-        # ancla final: cruce de meta en dist L (solo vueltas ya cerradas)
-        if d[-1] < L:
+        # ancla final: cruce de meta en dist L·scale (solo vueltas cerradas)
+        if d[-1] < L * scale:
             anchor = None
             if i1 < buf.n and int(lapcol[i1]) == lap + 1:
-                anchor = (float(buf.col("dist_lap")[i1]) + L, float(buf.col("t")[i1]))
+                # la primera muestra de la vuelta siguiente proyectada a este
+                # marco queda en lap_len + su avance: cubre L·scale (el mm
+                # extra evita que el redondeo de L·scale caiga fuera y NaN)
+                anchor = (float(buf.col("dist_total")[i1]) - base + 1e-3,
+                          float(buf.col("t")[i1]))
             elif completed and (L - d[-1]) < L * 0.05:
                 v1 = max(float(buf.col("speed")[i1 - 1]), 5.0) / 3.6
                 anchor = (L + 1e-6, float(t[-1]) + min((L - d[-1]) / v1, 5.0))
@@ -99,7 +176,8 @@ class TimingAnalyzer:
                 d = np.append(d, anchor[0])
                 t = np.append(t, anchor[1])
 
-        marks = np.interp(self._mark_dists(), d, t, left=np.nan, right=np.nan)
+        marks = np.interp(self._mark_dists() * scale, d, t,
+                          left=np.nan, right=np.nan)
         if completed:  # vuelta cerrada: inmutable, cachear
             self._marks_cache[(drv, lap)] = marks
         return marks
@@ -107,19 +185,33 @@ class TimingAnalyzer:
     # ------------------------------------------------------------ tiempos
 
     def lap_time(self, drv: str, lap: int) -> float:
+        """Tiempo de vuelta: el oficial del feed si ya llegó, si no el
+        interpolado de la telemetría."""
+        off = self.hub.official_times.get((drv, lap))
+        if off is not None and off[3] == off[3]:
+            return float(off[3])
         marks = self.lap_marks(drv, lap)
         if marks is None:
             return float("nan")
         return float(marks[-1] - marks[0])
 
     def sector_times(self, drv: str, lap: int) -> list[float]:
+        """Sectores de la vuelta: cada uno el oficial si ya llegó, si no el
+        interpolado."""
         marks = self.lap_marks(drv, lap)
         if marks is None:
-            return [float("nan")] * 3
-        return [
-            float(marks[(k + 1) * SECTOR_STEP] - marks[k * SECTOR_STEP])
-            for k in range(3)
-        ]
+            times = [float("nan")] * 3
+        else:
+            times = [
+                float(marks[(k + 1) * SECTOR_STEP] - marks[k * SECTOR_STEP])
+                for k in range(3)
+            ]
+        off = self.hub.official_times.get((drv, lap))
+        if off is not None:
+            for k in range(3):
+                if off[k] == off[k]:
+                    times[k] = float(off[k])
+        return times
 
     def micro_times(self, drv: str, lap: int) -> np.ndarray | None:
         marks = self.lap_marks(drv, lap)
@@ -164,7 +256,19 @@ class TimingAnalyzer:
         return self._latest_segments(drv, 1)
 
     def latest_sector_times(self, drv: str) -> tuple[np.ndarray, np.ndarray] | None:
-        return self._latest_segments(drv, SECTOR_STEP)
+        """Sectores rodantes; cada valor se reemplaza por el oficial de su
+        vuelta de origen apenas el feed lo publica (segundos después del
+        cruce), quedando el interpolado solo para lo aún no cronometrado."""
+        data = self._latest_segments(drv, SECTOR_STEP)
+        if data is None:
+            return None
+        times, laps = data
+        times = times.copy()
+        for k in range(3):
+            off = self.hub.official_times.get((drv, int(laps[k])))
+            if off is not None and off[k] == off[k]:
+                times[k] = off[k]
+        return times, laps
 
     def latest_corner_speeds(self, drv: str, dists) -> tuple[np.ndarray, np.ndarray] | None:
         """Velocidad mínima en cada curva (ventana ±60 m alrededor del

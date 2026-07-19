@@ -21,6 +21,8 @@ class BaseSource(QThread):
     trackStatus = Signal(object)      # [(t0, t1, código)] banderas/SC (t1=inf abierto)
     weather = Signal(object)          # [(t, t_aire, t_pista, viento_ms, lluvia)]
     sectorYellows = Signal(object)    # [(t0, t1, d0, d1)] amarillas por sector
+    sectorTimes = Signal(object)      # [(driver, vuelta, sector 0|1, segundos)] oficiales
+    segmentStatus = Signal(object)    # [(driver, sector, µsector, estado)] feed oficial
     failed = Signal(str)
 
     def set_speed(self, speed: float) -> None:

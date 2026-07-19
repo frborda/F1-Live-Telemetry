@@ -19,9 +19,20 @@ from PySide6.QtWidgets import (
 from ..hub import DataHub
 from ..timing import N_MICRO, TimingAnalyzer
 from . import theme
+from .docks import Detachable
 from .charts import DoubleClickHider, EdgeSmoother, HoverProbe, legend_set_dim, series_pens
 
 _BEST_COLOR = "#c9a1ff"  # mejor tiempo (violeta, convención F1)
+
+# estados de los microsectores oficiales (feed TimingData → Segments)
+_SEG_COLORS = {
+    2051: QColor(178, 132, 232),  # violeta: mejor de la sesión
+    2049: QColor(46, 158, 91),    # verde: mejor personal
+    2048: QColor(214, 190, 60),   # amarillo: completado sin mejora
+    2064: QColor(74, 127, 212),   # azul: pit lane
+}
+_SEG_UNKNOWN = QColor(120, 120, 120, 110)   # código no mapeado
+_SEG_EMPTY = QColor(255, 255, 255, 16)      # aún no cruzado
 
 # tinte de fondo por compuesto de neumático (convención Pirelli)
 _COMPOUND_BG = {
@@ -37,15 +48,15 @@ def fmt_laptime(sec: float) -> str:
     if not math.isfinite(sec) or sec <= 0:
         return "—"
     m, s = divmod(sec, 60.0)
-    return f"{int(m)}:{s:05.2f}"
+    return f"{int(m)}:{s:06.3f}"
 
 
 def fmt_secs(sec: float) -> str:
-    return f"{sec:.2f}" if math.isfinite(sec) else "—"
+    return f"{sec:.3f}" if math.isfinite(sec) else "—"
 
 
 def fmt_gap(sec: float) -> str:
-    return f"{sec:+.2f}" if math.isfinite(sec) else "—"
+    return f"{sec:+.3f}" if math.isfinite(sec) else "—"
 
 
 def _delta_bg(delta: float) -> QColor | None:
@@ -135,6 +146,8 @@ class TimingView(QWidget):
             "Accuracy ~±0.1 s — not official timing."
         )
         top.addWidget(note)
+        self._note = note
+        self._note_official = False
         layout.addLayout(top)
 
         self.plot = pg.PlotWidget(axisItems={"bottom": DistanceAxis(hub, orientation="bottom")})
@@ -153,7 +166,7 @@ class TimingView(QWidget):
         self._probe = HoverProbe(
             self.plot, self._hover_series,
             x_format=self._fmt_pos,
-            y_format=lambda y: f"{y:+.2f} s",
+            y_format=lambda y: f"{y:+.3f} s",
             hover_cb=self._probe_hover,
         )
         self.hover_dist_cb = None
@@ -183,7 +196,17 @@ class TimingView(QWidget):
             table.setSelectionMode(QTableWidget.NoSelection)
             table.setAlternatingRowColors(True)
         for c in range(N_MICRO):
-            self.micro_table.setColumnWidth(c, 52)
+            self.micro_table.setColumnWidth(c, 60)  # "+0.123" entra sin cortar
+        self.segments_table = QTableWidget(0, 0)
+        self.segments_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.segments_table.setSelectionMode(QTableWidget.NoSelection)
+        self.segments_table.setToolTip(
+            "Official mini-sector status from F1 live timing (the colored dashes of\n"
+            "the official app): purple = session best, green = personal best,\n"
+            "yellow = completed without improving, blue = pit lane.\n"
+            "Only the Live and Capture sources carry this feed."
+        )
+        self._seg_layout: tuple | None = None
         self.corners_table = QTableWidget(0, 0)
         self.corners_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.corners_table.setSelectionMode(QTableWidget.NoSelection)
@@ -219,9 +242,11 @@ class TimingView(QWidget):
         self.tabs.addTab(self.summary_table, "Summary")
         self.tabs.addTab(self.laps_table, "By lap")
         self.tabs.addTab(self.micro_table, "Microsectors")
+        self.tabs.addTab(self.segments_table, "Official µ")
         self.tabs.addTab(self.corners_table, "Corners")
         self.tabs.addTab(self._deg_container, "Degradation")
-        layout.addWidget(self.tabs, stretch=2)
+        self.tables_panel = Detachable("times_tables", "Times / Gap tables", self.tabs)
+        layout.addWidget(self.tables_panel, stretch=2)
 
         hub.driversChanged.connect(self._on_drivers_changed)
 
@@ -281,6 +306,9 @@ class TimingView(QWidget):
         self.laps_table.setRowCount(0)
         self.laps_table.setColumnCount(0)
         self.micro_table.setRowCount(0)
+        self.segments_table.setRowCount(0)
+        self.segments_table.setColumnCount(0)
+        self._seg_layout = None
 
     def refresh(self) -> None:
         if not self.selected:
@@ -326,17 +354,29 @@ class TimingView(QWidget):
         self._update_lap_lines()
         if self._tick % 15 == 0:  # tablas a 2 Hz, solo la pestaña visible
             self._update_status_regions(ref)
-            tab = self.tabs.currentIndex()
-            if tab == 0:
-                self._update_summary(ref)
-            elif tab == 1:
-                self._update_laps_table()
-            elif tab == 2:
-                self._update_micro(ref)
-            elif tab == 3:
-                self._update_corners(ref)
-            else:
-                self._update_degradation()
+            self.refresh_tables(ref)
+
+    def refresh_tables(self, ref: str | None = None) -> None:
+        """Refresca la pestaña de tablas visible; también se llama con el
+        panel de tablas flotante mientras otro modo está activo."""
+        if not self.selected:
+            return
+        if ref is None:
+            ref = self.ref_combo.currentData() or self.selected[0]
+        self._update_note()
+        tab = self.tabs.currentIndex()
+        if tab == 0:
+            self._update_summary(ref)
+        elif tab == 1:
+            self._update_laps_table()
+        elif tab == 2:
+            self._update_micro(ref)
+        elif tab == 3:
+            self._update_segments()
+        elif tab == 4:
+            self._update_corners(ref)
+        else:
+            self._update_degradation()
 
     # -------------------------------------------------------------- interno
 
@@ -752,3 +792,67 @@ class TimingView(QWidget):
                     item.setToolTip("Most recent completed microsector")
                 self.micro_table.setItem(r, c, item)
         self.micro_table.setVerticalHeaderLabels(labels)
+
+    def _update_note(self) -> None:
+        """La nota refleja si los sectores ya están anclados a los oficiales."""
+        official = self.hub.sector_bounds is not None
+        if official == self._note_official:
+            return
+        self._note_official = official
+        if official:
+            b1, b2 = self.hub.sector_bounds
+            self._note.setText("official sectors (?)")
+            self._note.setToolTip(
+                "S1/S2/S3 are anchored to the REAL sector boundaries, located by\n"
+                "crossing the official sector times with the telemetry\n"
+                f"(S1 ends at {b1:,.0f} m, S2 at {b2:,.0f} m). As soon as the feed\n"
+                "publishes each official sector/lap time (seconds after the\n"
+                "crossing), tables show that exact value; interpolated ~±0.1 s\n"
+                "values only cover what is not timed yet (the rolling current\n"
+                "lap and microsectors). Dimmed = from exactly one lap ago."
+            )
+        else:
+            self._note.setText("live µsectors · ~±0.1 s (?)")
+            self._note.setToolTip(
+                "Sectors and microsectors by distance (24 equal splits of the lap), computed\n"
+                "live over the current lap; dimmed values come from exactly one lap ago.\n"
+                "Accuracy ~±0.1 s — not official timing."
+            )
+
+    def _update_segments(self) -> None:
+        """Microsectores oficiales del feed (rayitas de colores de la app de
+        F1): una celda coloreada por segmento, filas en orden de pista."""
+        table = self.segments_table
+        counts = self.hub.segment_counts
+        if not counts:
+            table.setRowCount(0)
+            table.setColumnCount(0)
+            return
+        secs = sorted(counts)
+        columns = [(s, i) for s in secs for i in range(counts[s])]
+        if self._seg_layout != tuple(columns):
+            self._seg_layout = tuple(columns)
+            table.setColumnCount(len(columns))
+            table.setHorizontalHeaderLabels(
+                [f"S{s + 1}" if i == 0 else "" for s, i in columns]
+            )
+            for c in range(len(columns)):
+                table.setColumnWidth(c, 18)
+        ordered = self._by_track_position()
+        table.setRowCount(len(ordered))
+        labels = []
+        for r, drv in enumerate(ordered):
+            buf = self.hub.buffers.get(drv)
+            cur_lap = buf.current_lap() if buf else 0
+            labels.append(f"{self._code_of(drv)} L{cur_lap}" if cur_lap else self._code_of(drv))
+            state = self.hub.segments.get(drv, {})
+            for c, key in enumerate(columns):
+                status = int(state.get(key, 0))
+                if status == 0:
+                    bg = _SEG_EMPTY
+                else:
+                    bg = _SEG_COLORS.get(status, _SEG_UNKNOWN)
+                item = _cell("", bg=bg)
+                item.setToolTip(f"S{key[0] + 1} µ{key[1] + 1} · status {status}")
+                table.setItem(r, c, item)
+        table.setVerticalHeaderLabels(labels)
