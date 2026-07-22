@@ -421,7 +421,7 @@ F1TV sign-in extension and provides an uninstaller.
 ## Automatic updates
 
 Both the visualizer and the capturer check the
-[latest GitHub release](https://github.com/frborda/F1-Live-Telemetry/releases)
+[latest GitHub release](https://github.com/frborda/BoxBox-F1/releases)
 shortly after startup, and on demand via the **vX.Y.Z** button in the status
 bar (bottom-right corner of each window). When a newer version exists, a
 dialog shows its release notes and offers **Download and install**, with the

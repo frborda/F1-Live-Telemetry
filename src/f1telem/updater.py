@@ -20,7 +20,7 @@ from pathlib import Path
 
 from . import __version__, config
 
-REPO = "frborda/F1-Live-Telemetry"
+REPO = "frborda/BoxBox-F1"
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_URL = f"https://github.com/{REPO}/releases"
 ASSET_NAME = "BoxBox-F1-win64.zip"

@@ -9,6 +9,18 @@ if (-not (Test-Path $python)) {
     & $python -m pip install --disable-pip-version-check -q -r (Join-Path $root "requirements.txt") pyinstaller
 }
 
+# candado anti-concurrencia: dos builds a la vez se pisan en dist\ (uno
+# limpia mientras el otro empaqueta). Un lock con PID muerto se ignora.
+$lockFile = Join-Path $root "build.lock"
+if (Test-Path $lockFile) {
+    $oldPid = Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($oldPid -and (Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue)) {
+        Write-Host "Build blocked - another build is already running (PID $oldPid)."
+        exit 1
+    }
+}
+$PID | Out-File $lockFile -Encoding ascii
+
 # la app o el capturador corriendo DESDE dist bloquean sus DLLs y PyInstaller
 # aborta en COLLECT al limpiar la carpeta: avisar y cortar antes
 $app = Join-Path $root "dist\BoxBox-F1"
@@ -17,6 +29,7 @@ $locking = @(Get-Process -Name "BoxBox-F1", "BoxBox-F1-Capture" -ErrorAction Sil
 if ($locking) {
     Write-Host "Build blocked - close these first (they run from dist\BoxBox-F1):"
     $locking | ForEach-Object { Write-Host "  $($_.Name)  (PID $($_.Id))" }
+    Remove-Item $lockFile -ErrorAction SilentlyContinue
     exit 1
 }
 # pre-limpieza con reintentos: locks transitorios (antivirus, sync de la
@@ -26,6 +39,7 @@ foreach ($dir in @($app, (Join-Path $root "dist\capture"))) {
         try { Remove-Item $dir -Recurse -Force -ErrorAction Stop } catch {
             if ($i -ge 5) {
                 Write-Host "Cannot clean $dir after $i tries: $_"
+                Remove-Item $lockFile -ErrorAction SilentlyContinue
                 exit 1
             }
             Write-Host "dist locked (try $i), retrying in 2 s..."
@@ -81,8 +95,10 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host ""
     Write-Host "Done: $(Join-Path $root 'dist\BoxBox-F1\BoxBox-F1.exe')"
     Write-Host "      $zip"
+    Remove-Item $lockFile -ErrorAction SilentlyContinue
 } else {
     # sin esto el script "terminaba bien" (exit 0) con el build roto
     Write-Host "Build FAILED (PyInstaller exit $LASTEXITCODE)."
+    Remove-Item $lockFile -ErrorAction SilentlyContinue
     exit 1
 }

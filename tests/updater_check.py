@@ -49,7 +49,7 @@ check(updater.is_newer("1.10.0", "1.9.0"), "is_newer no alfabético")
 
 release = {
     "tag_name": "v9.9.9",
-    "html_url": "https://github.com/frborda/F1-Live-Telemetry/releases/tag/v9.9.9",
+    "html_url": "https://github.com/frborda/BoxBox-F1/releases/tag/v9.9.9",
     "body": "notas",
     "assets": [
         {"name": "otro.txt", "browser_download_url": "x", "size": 1},
