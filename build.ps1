@@ -70,7 +70,25 @@ if ($LASTEXITCODE -eq 0) {
     $zip = Join-Path $root "dist\BoxBox-F1-win64.zip"
     Write-Host "Zipping release asset..."
     if (Test-Path $zip) { Remove-Item $zip -Force }
-    Compress-Archive -Path (Join-Path $root "dist\BoxBox-F1") -DestinationPath $zip
+    # el antivirus/sync suele tener tomado algun archivo recien escrito:
+    # reintentar, y FALLAR ruidosamente si no sale (un release sin zip no
+    # es un release)
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            Compress-Archive -Path (Join-Path $root "dist\BoxBox-F1") `
+                -DestinationPath $zip -Force -ErrorAction Stop
+            break
+        } catch {
+            if (Test-Path $zip) { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
+            if ($i -ge 5) {
+                Write-Host "Zip FAILED after $i tries: $_"
+                Remove-Item $lockFile -ErrorAction SilentlyContinue
+                exit 1
+            }
+            Write-Host "zip locked (try $i), retrying in 3 s..."
+            Start-Sleep -Seconds 3
+        }
+    }
     # instalador (si Inno Setup 6 esta disponible): dist\BoxBox-F1-setup.exe
     $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
               "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
