@@ -9,28 +9,34 @@ weather and race-control panels and a notification center — every view in
 **its own window**, driven from a compact control hub. Built with
 [Fast-F1](https://github.com/theOehrly/Fast-F1), PySide6 and pyqtgraph.
 
-![BoxBox-F1 — multi-window layout during a Safety Car: timing tower, Race 2 chart, lap wheel with live intervals, drivers, race trace, track map with a yellow sector and the timeline](docs/data.png)
+![BoxBox-F1 — race layout: control hub, timing tower with JRT delta graphs and reference deltas, pit lane with a dimmed OUT car, tyre stints, track map, lap wheel and the timeline](docs/1.png)
 
-**Control hub** — the whole app is driven from one narrow window: data
-source, the window catalog (Drivers and Timeline featured), window
-profiles and settings. Every view opens in its own window:
+**Qualy Lap Compare** — live laps against a target lap: channel traces,
+the cumulative delta trace, and per-driver sector/microsector delta cards
+updating in real time:
 
-![Control hub with the window catalog and profiles](docs/main.png)
+![Qualy Lap Compare against a target lap, with delta cards, track map and lap wheel](docs/2.png)
 
-**Race mode** — telemetry charts while replaying a race, with timing tower
-and track map:
+**Race context** — session status (VSC ending), race control log, pit
+lane, weather evolution and the **Track dominance** map with each zone
+painted and initialled by its fastest driver:
 
-![Race mode replaying a race, with timing tower and track map](docs/screenshot.png)
+![Race context panels and the Track dominance map with per-zone driver initials](docs/3.png)
+
+**Strategy** — tyre strategy bars, tyre stints chips, and the race trace
+with one point per microsector:
+
+![Tyre strategy, tyre stints and race trace during a race](docs/4.png)
+
+**Race 2** — telemetry with distance on the X axis: three cars over one
+lap, crosshair tooltip, peaks labelled, synchronized with the track map:
+
+![Race 2 chart comparing three cars, with the track map](docs/5.png)
 
 **Times / Gap** — gap to a reference driver over the whole race, tyre
 degradation per stint and the timing tower with pit stops and averages:
 
-![Times / Gap mode with degradation analysis](docs/screenshot-gap.png)
-
-**Qualy Lap Compare** — live laps against a target lap, with the cumulative
-delta trace and per-sector/microsector delta cards updating in real time:
-
-![Qualy Lap Compare mode against a target lap](docs/screenshot-quali.png)
+![Times / Gap mode with degradation analysis](docs/6.png)
 
 ## All-windows model
 
@@ -216,8 +222,6 @@ follows the most recent capture file.
   `f1tv.formula1.com`, open DevTools (F12) → **Application** → **Cookies**
   → `https://f1tv.formula1.com`, copy the **value** of the `login-session`
   cookie and paste it (the raw subscription JWT is accepted too).
-
-![Capturer recording the live stream during a race, authenticated with F1TV](docs/capture.png)
 
 ## Features
 
