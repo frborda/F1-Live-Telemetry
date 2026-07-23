@@ -2538,6 +2538,8 @@ def test_app_demo(app: QApplication) -> None:
     bal.refresh()
     grip = win.analysis_views["an_grip"]
     grip.refresh()
+    check("corner model:" in grip.summary.text(),
+          f"grip: indicador de entrenamiento ({grip.summary.text()[-60:]})")
     # tendencias en Grip degradation (y Deploy & Coast): tilde + tipo
     # (el panel está cerrado: _dirty difiere el redraw al refresh visible)
     n_g0 = len(grip.p_g.listDataItems())

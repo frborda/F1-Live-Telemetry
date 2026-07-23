@@ -1347,6 +1347,16 @@ class GripDegPanel(AnalysisPanelBase):
                 ["Driver", "Lap", "Peak lat G", "Vmin km/h"], table_rows)
         label = ("selected corners" if len(corner_ids) != sum(
             1 for z in zones if z.kind == "corner") else "all corners")
-        self.summary.setText(
-            f"Grip trend ({label}): " + "  |  ".join(lines) if lines
-            else "Need 4+ clean laps per driver for a trend")
+        text = (f"Grip trend ({label}): " + "  |  ".join(lines) if lines
+                else "Need 4+ clean laps per driver for a trend")
+        # estado del modelo de curvas: cuántas ya entrenaron y si se aplica
+        all_corners = [i for i, z in enumerate(zones) if z.kind == "corner"]
+        ready_n = sum(1 for zi in all_corners
+                      if self.engine.profiles.ready(zi))
+        passes = sum(s["passes"]
+                     for s in self.engine.profiles.zones.values())
+        state = ("ON" if self.engine.refine
+                 else "off — Settings › Corner model refinement")
+        text += (f"   ·   corner model: {ready_n}/{len(all_corners)} "
+                 f"trained · {passes} passes · {state}")
+        self.summary.setText(text)
