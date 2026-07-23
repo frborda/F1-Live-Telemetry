@@ -115,6 +115,7 @@ class ReplaySource(BaseSource):
         self._emit_sector_yellows(session)
         self._emit_sector_times(session)
         self._emit_race_control(session)
+        self._emit_quali_parts(session)
         self._emit_session_meta(session)
         pos_stream = self._prepare_positions(session)
 
@@ -418,6 +419,31 @@ class ReplaySource(BaseSource):
                 self.raceControl.emit(rows)
         except Exception:
             pass  # sin mensajes el panel queda vacío
+
+    def _emit_quali_parts(self, session) -> None:
+        """Inicios de Q1-Q3 desde session_status de Fast-F1 (misma fuente
+        que el feed oficial). Un 'Started' abre tanda SOLO si la anterior
+        ya terminó: los relanzamientos tras bandera roja no cuentan."""
+        try:
+            info = getattr(session, "session_info", None) or {}
+            name = str(info.get("Name") or session.name or "").lower()
+            if "quali" not in name and "shootout" not in name:
+                return
+            rows = []
+            part = 0
+            armed = True  # el primer Started abre Q1
+            for _, row in session.session_status.iterrows():
+                status = str(row.get("Status", "")).strip()
+                if status == "Started" and armed and part < 3:
+                    part += 1
+                    rows.append((float(row["Time"].total_seconds()), part))
+                    armed = False
+                elif status in ("Finished", "Finalised", "Ends"):
+                    armed = True
+            if rows:
+                self.qualiParts.emit(rows)
+        except Exception:
+            pass
 
     def _emit_session_meta(self, session) -> None:
         try:

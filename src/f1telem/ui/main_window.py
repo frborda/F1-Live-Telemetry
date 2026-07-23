@@ -1200,6 +1200,7 @@ class MainWindow(QMainWindow):
         source.lapCount.connect(self.hub.on_lap_count)
         source.sessionMeta.connect(self.hub.on_session_meta)
         source.retirements.connect(self.hub.on_retirements)
+        source.qualiParts.connect(self.hub.on_quali_parts)
         # config de microsectores por circuito+año: cargarla apenas la meta
         # identifica al fin de semana (después de que el hub la guardó)
         self._micro_cfg_key = None

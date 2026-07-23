@@ -41,6 +41,7 @@ FEEDS = [
     "LapCount",
     "RaceControlMessages",
     "ExtrapolatedClock",
+    "SessionData",
 ]
 _UTC_RE = re.compile(r"(\.\d{1,6})\d*")
 
@@ -149,6 +150,7 @@ class LiveDecoderMixin:
         self._segment_state: dict[tuple[str, int, int], int] = {}
         # dirección de carrera, stints, reloj y paradas
         self._rcm: dict[int, dict] = {}
+        self._quali_parts: dict[int, dict] = {}
         self._stints: dict[str, dict[int, dict]] = {}
         self._tyres: dict[str, dict[int, tuple[str, int]]] = {}
         self._clock: list | None = None
@@ -207,6 +209,8 @@ class LiveDecoderMixin:
             self._on_weather(data)
         elif name == "RaceControlMessages":
             self._on_race_control(data)
+        elif name == "SessionData":
+            self._on_session_data(data)
         elif name == "TimingAppData":
             self._on_timing_app(data)
         elif name == "ExtrapolatedClock":
@@ -300,6 +304,40 @@ class LiveDecoderMixin:
                 row["t"] = utc - self._t0
             rows.append(row)
         self.raceControl.emit(rows)
+
+    def _on_session_data(self, data) -> None:
+        """Delimitación OFICIAL de las tandas de clasificación: SessionData
+        publica QualifyingPart (1-3) con su timestamp. El snapshot trae la
+        serie completa; los diffs llegan indexados."""
+        if not isinstance(data, dict):
+            return
+        changed = False
+        for idx, entry in _index_items(data.get("Series")):
+            if not isinstance(entry, dict):
+                continue
+            part = entry.get("QualifyingPart")
+            if not isinstance(part, int) or part < 1:
+                continue
+            utc = None
+            try:
+                utc = _parse_utc(str(entry["Utc"]))
+            except (KeyError, ValueError):
+                pass
+            self._quali_parts[idx] = {"utc": utc, "t": self._last_rel_t,
+                                      "part": part}
+            changed = True
+        if changed:
+            self._emit_quali_parts()
+
+    def _emit_quali_parts(self) -> None:
+        rows = []
+        for key in sorted(self._quali_parts):
+            row = self._quali_parts[key]
+            t = row["t"]
+            if row["utc"] is not None and self._t0 is not None:
+                t = row["utc"] - self._t0
+            rows.append((float(t), int(row["part"])))
+        self.qualiParts.emit(rows)
 
     def _on_timing_app(self, data) -> None:
         """Stints de neumáticos: se acumulan los diffs por índice y se

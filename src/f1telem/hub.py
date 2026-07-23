@@ -172,6 +172,8 @@ class DataHub(QObject):
         self.last_move_t: dict[str, float] = {}
         self._stew_cache: tuple | None = None
         self._quali_cache: tuple | None = None
+        # inicios oficiales de las tandas de clasificación [(t, parte)]
+        self.quali_parts: list[tuple[float, int]] = []
         # estado de los microsectores oficiales: {driver: {(sector, µ): estado}}
         self.segments: dict[str, dict[tuple[int, int], int]] = {}
         self.segment_counts: dict[int, int] = {}
@@ -290,15 +292,37 @@ class DataHub(QObject):
         typ = str(self.session_meta.get("type", "")).lower()
         return "quali" in typ or "quali" in name or "shootout" in name
 
+    def on_quali_parts(self, rows) -> None:
+        """Inicios oficiales de Q1-Q3 (SessionData en vivo/captura,
+        session_status de Fast-F1 en replay): [(t, parte)]."""
+        try:
+            self.quali_parts = sorted(
+                (float(t), int(p)) for t, p in rows if 1 <= int(p) <= 3)
+        except (TypeError, ValueError):
+            return
+        self._quali_cache = None
+
     def quali_phase_bounds(self) -> list[float]:
-        """Inicios de Q2/Q3 ya cruzados por el timeline. La frontera entre
-        tandas es la PRIMERA luz verde posterior a cada bandera a cuadros:
-        las vueltas lanzadas antes de la cuadros cierran después de ella y
-        deben contar para la tanda que termina. Solo usa mensajes hasta
-        latest_t (sin spoilers: un seek atrás re-arma la tanda vieja)."""
-        sig = (len(self.race_control), round(self.latest_t, 1))
+        """Inicios de Q2/Q3 ya cruzados por el timeline. Fuente primaria:
+        los inicios OFICIALES de tanda (QualifyingPart). Fallback (capturas
+        viejas sin SessionData): la primera luz verde posterior a cada
+        bandera a cuadros — las vueltas lanzadas antes de la cuadros
+        cierran después y deben contar para la tanda que termina. Solo usa
+        datos hasta latest_t (sin spoilers: un seek atrás re-arma la tanda
+        vieja)."""
+        sig = (len(self.race_control), len(self.quali_parts),
+               round(self.latest_t, 1))
         if self._quali_cache is not None and self._quali_cache[0] == sig:
             return self._quali_cache[1]
+        parts = [(t, p) for t, p in self.quali_parts if t <= self.latest_t]
+        if parts:
+            bounds = []
+            for target in (2, 3):
+                t_p = next((t for t, p in parts if p == target), None)
+                if t_p is not None:
+                    bounds.append(t_p)
+            self._quali_cache = (sig, bounds)
+            return bounds
         cheqs: list[float] = []
         greens: list[float] = []
         for msg in self.race_control:
@@ -681,6 +705,7 @@ class DataHub(QObject):
         self.last_move_t.clear()
         self._stew_cache = None
         self._quali_cache = None
+        self.quali_parts = []
         self.segments.clear()
         self.segment_counts.clear()
         self.latest_t = 0.0

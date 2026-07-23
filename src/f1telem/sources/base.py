@@ -30,6 +30,7 @@ class BaseSource(QThread):
     lapCount = Signal(object)         # (vuelta_actual, total) en carreras
     sessionMeta = Signal(object)      # {"type", "meeting", "name"} de SessionInfo
     retirements = Signal(object)      # [driver, ...] retirados oficiales (Retired)
+    qualiParts = Signal(object)       # [(t, parte 1-3)] inicios oficiales de Q1-Q3
     failed = Signal(str)
 
     def set_speed(self, speed: float) -> None:

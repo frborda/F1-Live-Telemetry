@@ -94,6 +94,22 @@ def test_live_decoder() -> None:
                         ]}), "ts"]}]})
     check(got[-1].lap == 5 and got[-1].dist_lap == 0.0,
           f"reinicio de dist_lap al cambiar de vuelta (lap={got[-1].lap}, d={got[-1].dist_lap})")
+    # QualifyingPart oficial (SessionData): snapshot + diff, t vía UTC
+    got_q: list = []
+    src.qualiParts.connect(
+        lambda rows: (got_q.clear(), got_q.extend(rows)),
+        Qt.DirectConnection)
+    src._handle({"M": [{"H": "Streaming", "M": "feed", "A": [
+        "SessionData",
+        {"Series": {"0": {"Utc": "2026-07-05T14:00:00.1234567Z",
+                          "QualifyingPart": 1},
+                    "1": {"Utc": "2026-07-05T14:20:00.1234567Z",
+                          "QualifyingPart": 2}}},
+        "ts"]}]})
+    check(len(got_q) == 2 and got_q[0][1] == 1 and got_q[1][1] == 2
+          and abs(got_q[1][0] - 1200.0) < 1.5,
+          f"decoder: QualifyingPart oficial con t relativo ({got_q})")
+
     rt = decompress_feed(zpack({"a": 1}))
     check(rt == {"a": 1}, "decompress_feed ida y vuelta")
 
@@ -976,6 +992,7 @@ def test_quali_tower() -> None:
           and tw.rows[6].out_tag == "OUT Q1",
           "quali: métrica respeta los bloques")
     tw.sort_combo.setCurrentIndex(tw.sort_combo.findData("position"))
+    t_end_q = hub_q.latest_t
     # seek atrás: el timeline al final de Q1 re-arma la tanda 1 (a t=260
     # todas las vueltas de Q1 ya cerraron y la cuadros aún no cayó)
     hub_q.latest_t = 260.0
@@ -986,6 +1003,16 @@ def test_quali_tower() -> None:
     # el pintado con separadores/drop no debe crashear
     tw.canvas.resize(600, 400)
     tw.canvas.grab()
+    # los inicios OFICIALES de tanda (QualifyingPart) mandan sobre la
+    # inferencia por banderas, con el mismo anti-spoiler
+    hub_q.latest_t = t_end_q
+    hub_q.on_quali_parts([(0.0, 1), (350.0, 2), (750.0, 3)])
+    check(hub_q.quali_phase_bounds() == [350.0, 750.0],
+          f"quali: límites oficiales mandan ({hub_q.quali_phase_bounds()})")
+    hub_q.latest_t = 500.0
+    check(hub_q.quali_phase_bounds() == [350.0],
+          "quali: límite oficial futuro oculto (anti-spoiler)")
+    hub_q.latest_t = t_end_q
 
 
 def test_app_demo(app: QApplication) -> None:
