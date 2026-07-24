@@ -1143,6 +1143,36 @@ def test_strategy_board() -> None:
           f"pit strategy: Ventana de Box sembrada por el prior "
           f"({psv.window_spin.value():.1f}s)")
 
+    # ---- plan de gomas: una parada "gratis" que fuerza OTRA parada
+    # corta cerca del final no es óptima — el motor la demora (vida de
+    # compuestos minada del uso real 2022-2026)
+    from f1telem.strategy_tyres import TYRE_LIFE as _TL
+    reach_t = max(int(v[1]) for c, v in _TL["Belgian Grand Prix"].items()
+                  if c in ("SOFT", "MEDIUM", "HARD"))
+    hub_t = _DH()
+    hub_t.on_track_length(6940.0)
+    hub_t.on_session_meta({"type": "Race", "name": "Race",
+                           "meeting": "Belgian Grand Prix", "year": 2099})
+    hub_t.on_tyres({"1": {1: ("HARD", 10)}, "2": {1: ("HARD", 10)}})
+    batch = []
+    for drv, off in (("1", 0.0), ("2", 1200.0)):
+        for k in range(150):
+            t = k * 2.0
+            d = 50.0 * t - off
+            if d < 0:
+                continue
+            batch.append(_S(drv, t, int(d // 6940.0) + 1, d % 6940.0,
+                            d, 180.0, 90.0, 0.0, 0.0, 6, 0))
+    hub_t.on_batch(batch)
+    lap_now_t = hub_t.buffers["1"].current_lap()
+    hub_t.on_lap_count((lap_now_t, lap_now_t + reach_t + 3))
+    adv_t = StrategyEngine(hub_t, _TA(hub_t)).evaluate()["1"]
+    check(adv_t.action == "WATCH"
+          and "one-stopper" in " ".join(adv_t.trace)
+          and adv_t.factors["tyre_plan"]["defer"] == 3,
+          f"estrategia: parada gratis mal timeada por gomas → esperar "
+          f"({adv_t.action})")
+
     # ---- fase 3: cliff de goma, ventana de ataque y proyección a bandera
     hub_c = _DH()
     hub_c.on_track_length(3000.0)

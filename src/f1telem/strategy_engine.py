@@ -102,6 +102,10 @@ THREAT_EXIT_GAP = 2.5    # ya en WATCH, se sale recién arriba de 2.5 s:
 FLAG_NET_MIN = 5.0       # s netos mínimos para el last-call a bandera
 LAST_CALL_LAPS = 10      # vueltas finales donde aplica el last-call
 COVER_WINDOW_S = 90.0    # s tras la parada rival en que se puede responder
+# plan de gomas: si ningún compuesto llega a la bandera desde acá pero
+# esperando hasta DEFER_MAX vueltas SÍ llega, parar ahora fuerza una
+# parada corta extra cerca del final — la zona incómoda a evitar
+DEFER_MAX = 8
 # histéresis anti-oscilación: el backtest midió 56% de cambios A→B→A en
 # <5 min — un veredicto nuevo de baja urgencia debe sostenerse este
 # tiempo antes de reemplazar al vigente (urgencia 2 e IN PIT no esperan)
@@ -165,6 +169,24 @@ def circuit_prior(hub) -> dict | None:
                                - float(hub.track_length)) <= 300.0:
         return row
     return None
+
+
+def circuit_tyres(hub) -> dict | None:
+    """Vida de gomas por compuesto medida en este circuito 2022-2026
+    ({compuesto: [mediana, P90, n]} de vueltas por juego, minada de los
+    stints reales). GLOBAL como fallback para circuitos sin historia."""
+    try:
+        from .strategy_tyres import TYRE_LIFE
+    except ImportError:
+        return None
+    meeting = str(hub.session_meta.get("meeting", "")).strip()
+    row = TYRE_LIFE.get(meeting)
+    if row is not None:
+        tl = row.get("track_length")
+        if tl is None or abs(float(tl)
+                             - float(hub.track_length)) <= 300.0:
+            return row
+    return TYRE_LIFE.get("GLOBAL")
 
 
 def neutral_between(hub, t0: float, t1: float) -> str | None:
@@ -882,6 +904,7 @@ class StrategyEngine:
         trends = self._lap_trends(gaps, self._lap_s)
         self._update_stuck(ordered, gaps)
         stints = {d: self._stint(d) for d in ordered}
+        tlife = circuit_tyres(hub)
         recent_pits = self._recent_pits()
         leader_buf = hub.buffers.get(ordered[0])
         lap_now = (leader_buf.current_lap()
@@ -986,6 +1009,33 @@ class StrategyEngine:
                     f"{stint['slope']:+.3f}s/lap deg ≈ {lost:.1f}s lost "
                     f"vs stop cost {window_now:.1f}s → net "
                     f"{flag_delta:+.1f}s for pitting now")
+
+            # plan de gomas: ¿un juego NUEVO llega a la bandera desde
+            # acá? Si no llega pero esperando ≤DEFER_MAX vueltas sí,
+            # parar ahora fuerza una parada corta extra al final —
+            # sugerirlo no es óptimo (uso real 2022-2026 por circuito)
+            tyre_defer = 0
+            flag_reach = 0
+            best_comp = ""
+            if laps_left is not None and laps_left > 0 and tlife:
+                for comp in ("HARD", "MEDIUM", "SOFT"):
+                    v = tlife.get(comp)
+                    if v and int(v[1]) > flag_reach:
+                        best_comp, flag_reach = comp, int(v[1])
+                if flag_reach:
+                    tyre_defer = max(0, laps_left - flag_reach)
+                    factors["tyre_plan"] = {
+                        "best_compound": best_comp,
+                        "reach_p90": flag_reach,
+                        "laps_left": laps_left, "defer": tyre_defer}
+                    if 0 < tyre_defer <= DEFER_MAX:
+                        trace.append(
+                            "tyre plan: no fresh set reaches the flag "
+                            f"from here ({best_comp} P90 ≈{flag_reach} "
+                            f"laps at this circuit, {laps_left} to go) "
+                            f"— waiting ~{tyre_defer} laps makes it a "
+                            "one-stopper")
+            mistimed = 0 < tyre_defer <= DEFER_MAX
 
             threats: list[str] = []
             # el rival posicional es el próximo EN VUELTA: un doblado en
@@ -1098,6 +1148,18 @@ class StrategyEngine:
                         f"decision: STAY under {neutral} — cheap stop "
                         "saves no position AND rejoins stuck (passing is "
                         "hard: clear air outweighs the cheap window)")
+                elif mistimed:
+                    action, reason = "STAY", (
+                        f"{neutral}: cheap now, but no set reaches "
+                        "the flag")
+                    urgency = 1
+                    trace.append(
+                        f"decision: STAY under {neutral} — the window "
+                        "is cheap BUT no fresh compound covers the "
+                        f"remaining {laps_left} laps ({best_comp} P90 "
+                        f"≈{flag_reach}): stopping now forces an extra "
+                        "short stop near the end that costs more than "
+                        "the discount saves")
                 else:
                     action = "BOX NOW"
                     reason = (f"{neutral}: cheap stop "
@@ -1193,6 +1255,18 @@ class StrategyEngine:
                         "would trade the undercut loss for a trap "
                         "(passing is hard); pit when the rejoin clears"
                         + scan_txt)
+                elif mistimed:
+                    action, reason = "STAY", (
+                        f"{r_code}'s stop can't reach the flag either "
+                        "— hold")
+                    urgency = 1
+                    trace.append(
+                        f"decision: STAY — {r_code} pitted but NO "
+                        f"fresh set covers the {laps_left} laps left "
+                        f"({best_comp} P90 ≈{flag_reach}): their "
+                        "undercut just became a 2-stopper — holding "
+                        "keeps us on one stop and the position comes "
+                        "back when they stop again")
                 else:
                     action = f"COVER {r_code}"
                     reason = (f"rival pitted {ago:.0f}s ago — respond "
@@ -1221,6 +1295,18 @@ class StrategyEngine:
                         "makes a stop free on paper, but with "
                         f"{laps_left} laps to the flag fresh tyres buy "
                         "nothing — hold to the end")
+                elif mistimed:
+                    action, reason = "WATCH", (
+                        f"free window, but hold ~{tyre_defer} laps "
+                        "(tyre plan)")
+                    urgency = 1
+                    trace.append(
+                        "decision: WATCH — the stop is free BUT no "
+                        f"fresh set reaches the flag ({laps_left} left "
+                        f"vs {best_comp} ≈{flag_reach}): pitting now "
+                        "forces an extra short stop near the end — "
+                        f"hold ~{tyre_defer} laps and keep the free "
+                        "window" + scan_txt)
                 elif traffic is not None and not traffic["clear"]:
                     who, wgap = traffic["ahead_close"][0]
                     w_tag = (" (lapped)" if who in traffic["lapped"]
@@ -1253,7 +1339,7 @@ class StrategyEngine:
                     and (proj[0] - (i + 1)) <= AIR_MAX_LOSS \
                     and stint["age"] >= 6 \
                     and stints.get(prev, {}).get("age", 0) \
-                    >= FRESH_AGE_MIN and not endgame:
+                    >= FRESH_AGE_MIN and not endgame and not mistimed:
                 # veredicto de ATAQUE (minado del comportamiento real):
                 # el motor solo defendía, pero la curva medida vale
                 # igual desde el atacante — a <1 s el de adelante pierde
@@ -1278,7 +1364,8 @@ class StrategyEngine:
             elif stuck >= STUCK_LAPS and traffic is not None \
                     and traffic["clear"] and proj is not None \
                     and (proj[0] - (i + 1)) <= AIR_MAX_LOSS \
-                    and stint["age"] >= 6 and not endgame:
+                    and stint["age"] >= 6 and not endgame \
+                    and not mistimed:
                 action = "BOX FOR AIR"
                 reason = (f"stuck {stuck} laps · rejoin in clear air")
                 urgency = 1
