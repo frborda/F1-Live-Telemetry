@@ -24,7 +24,7 @@ $PID | Out-File $lockFile -Encoding ascii
 # la app o el capturador corriendo DESDE dist bloquean sus DLLs y PyInstaller
 # aborta en COLLECT al limpiar la carpeta: avisar y cortar antes
 $app = Join-Path $root "dist\BoxBox-F1"
-$locking = @(Get-Process -Name "BoxBox-F1", "BoxBox-F1-Capture" -ErrorAction SilentlyContinue |
+$locking = @(Get-Process -Name "BoxBox-F1", "BoxBox-F1-Capture", "BoxBox-F1-Harvest" -ErrorAction SilentlyContinue |
              Where-Object { $_.Path -and $_.Path.StartsWith($app) })
 if ($locking) {
     Write-Host "Build blocked - close these first (they run from dist\BoxBox-F1):"

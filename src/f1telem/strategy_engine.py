@@ -112,6 +112,18 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _json_safe(obj):
+    """NaN/Inf no son JSON estricto (jq, pandas y JS los rechazan):
+    degradarlos a null antes de persistir factores con slope/curv NaN."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def neutral_between(hub, t0: float, t1: float) -> str | None:
     """Neutralización que pisa [t0, t1] (SC gana sobre VSC)."""
     found = None
@@ -1167,12 +1179,12 @@ class StrategyEngine:
                     and self._log_path.stat().st_size > LOG_MAX_BYTES:
                 self._log_path.write_text("", "utf-8")
             with self._log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({
+                fh.write(json.dumps(_json_safe({
                     "wall": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     "t": round(self.hub.latest_t, 1), "lap": lap,
                     "car": code, "action": adv.action,
                     "reason": adv.reason, "trace": adv.trace,
                     "factors": adv.factors,
-                }, default=str) + "\n")
+                }), default=str) + "\n")
         except OSError:
             pass

@@ -38,7 +38,7 @@ import numpy as np
 from . import config
 from .hub import DataHub
 from .models import Sample
-from .strategy_engine import StrategyEngine
+from .strategy_engine import StrategyEngine, _json_safe
 from .timing import TimingAnalyzer
 
 OUTCOME_LAPS = 3     # vueltas para medir el desenlace de un veredicto
@@ -195,7 +195,7 @@ def harvest_session(year: int, gp: str, ses: str, out_dir: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / f"{key}.jsonl").open("w", encoding="utf-8") as fh:
         for rec in recorder.records:
-            fh.write(json.dumps(rec, default=str) + "\n")
+            fh.write(json.dumps(_json_safe(rec), default=str) + "\n")
     meas = engine.measures
     summary = {
         "year": year, "gp": gp, "session": ses,
@@ -215,7 +215,7 @@ def harvest_session(year: int, gp: str, ses: str, out_dir: Path,
         "wall_seconds": round(time.monotonic() - wall0, 1),
     }
     (out_dir / f"{key}.summary.json").write_text(
-        json.dumps(summary, indent=2, default=str), "utf-8")
+        json.dumps(_json_safe(summary), indent=2, default=str), "utf-8")
     return summary
 
 

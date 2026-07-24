@@ -1140,6 +1140,15 @@ def test_strategy_board() -> None:
     check(all(r["outcome"]["pos_final"] is not None
               for r in rec_r.records),
           "harvest: posición final en todos los registros")
+    # NaN de slope/curv jóvenes NO puede llegar al disco: JSON estricto
+    from f1telem.strategy_engine import _json_safe
+    ok_json = True
+    try:
+        for r in rec_r.records:
+            _json.dumps(_json_safe(r), default=str, allow_nan=False)
+    except ValueError:
+        ok_json = False
+    check(ok_json, "harvest: JSON estricto (sin NaN/Inf) en el log")
 
 
 def test_quali_tower() -> None:
