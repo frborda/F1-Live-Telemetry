@@ -93,6 +93,9 @@ CLIFF_AGE_MIN = 8        # goma más joven no cliffea: es ruido del ajuste
 THREAT_RISK = ((1.0, 21.5), (2.0, 7.7), (3.0, 4.8), (4.0, 3.1))
 THREAT_ACTION_GAP = 2.0  # solo <2 s (riesgo ≥8%) amerita WATCH activo;
 #                          entre 2 y u_range la amenaza se lista como info
+THREAT_EXIT_GAP = 2.5    # ya en WATCH, se sale recién arriba de 2.5 s:
+#                          la validación mostró que la frontera seca solo
+#                          MUEVE la oscilación (gaps respirando ±0.3 s)
 FLAG_NET_MIN = 5.0       # s netos mínimos para el last-call a bandera
 LAST_CALL_LAPS = 10      # vueltas finales donde aplica el last-call
 COVER_WINDOW_S = 90.0    # s tras la parada rival en que se puede responder
@@ -1240,7 +1243,11 @@ class StrategyEngine:
                     f"{laps_left} laps remain: every lap waited erodes "
                     "the net; rejoin is clear" + scan_txt)
             elif threats and ((gap_behind is not None
-                               and gap_behind < THREAT_ACTION_GAP)
+                               and gap_behind < (
+                                   THREAT_EXIT_GAP
+                                   if self._published.get(
+                                       drv, ("",))[0] == "WATCH"
+                                   else THREAT_ACTION_GAP))
                               or any("attack window" in t
                                      for t in threats)):
                 action, reason = "WATCH", threats[0]
