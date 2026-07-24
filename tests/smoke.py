@@ -1084,7 +1084,7 @@ def test_strategy_board() -> None:
     feed_laps_c("1", 0.0, [60.0, 60.0, 60.1, 60.2, 60.4, 60.7, 61.1,
                            61.6, 62.3, 63.1])
     feed_laps_c("2", 1.0, [61.0] * 10)
-    hub_c.on_lap_count((11, 14))
+    hub_c.on_lap_count((11, 25))
     eng_c = StrategyEngine(hub_c, _TA(hub_c))
     adv_c = eng_c.evaluate()
     tr_c = " ".join(adv_c["1"].trace)
@@ -1095,6 +1095,13 @@ def test_strategy_board() -> None:
           "estrategia: proyección a bandera trazada")
     check(any("attack window" in t for t in adv_c["2"].threats),
           "estrategia: rival adelante en el cliff → ventana de ataque")
+    # coherencia entre fases: en el ENDGAME ninguna rama pide parada
+    # voluntaria — el cliff se aguanta hasta la bandera
+    hub_c.on_lap_count((11, 13))
+    adv_c = eng_c.evaluate()
+    check(adv_c["1"].action == "WATCH",
+          f"estrategia: cliff en endgame se aguanta a bandera "
+          f"({adv_c['1'].action})")
 
 
 def test_quali_tower() -> None:
