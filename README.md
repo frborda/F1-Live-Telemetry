@@ -110,6 +110,7 @@ The rest of the catalog (each one described in detail under *Features*):
 | **Pit lane** | Live pit-lane history (own 👥 car filter): cars currently in the lane at full opacity on top, cars that already left **dimmed below with an "OUT · 3L" laps-ago counter** — nobody disappears until they pit again (the new visit renews their row). Each row highlights **both compounds** (entry → exit, the exit one filling in when the data arrives) and the clocks: lane time and stationary time — replaced by the **official stop time (STOP✓, OpenF1)** once published. A car stuck at 0 km/h for 30+ s (retirement, repairs, garage) is highlighted in red. |
 | **Pit lane map** | The whole pit lane unfolded left (entry, 80 sign) → right (chequered exit): two lanes — cars roll down the fast lane with direction chevrons and **drop into their stop bay** (garage strip below) while stationary, mechanics on all four wheels — with the four wheels painted in the **entry compound, switching to the exit compound** as they resume. Labels carry the lane clock and the frozen stop clock; motion is animated one batch behind the data (like the track map), and a 👥 filter picks the cars. |
 | **Pit strategy** | Pit window loss (*Ventana de Box*), a **Net** column (the virtual order of the pit cycle: every car with pending stops pays one Pit window — who is *really* ahead while the stops play out), and per row the **rejoin graphic**: `[HAM] ─3.5s─ [COL] ─2.6s─ [BOR]` — if this car pits now, who it comes out behind and ahead of, with the margins; a green ✓ marks **free stops** (pitting loses no position). |
+| **Strategy board** | A live **verdict per car** — IN PIT · BOX NOW (cheap SC/VSC stop) · COVER (respond to a rival's stop) · FREE STOP · **UNDERCUT** (attack the car ahead via the pit lane) · BOX FOR AIR · BOX SOON (tyre cliff / stint life) · WATCH · STAY — recalculated every second with **full traceability**: the tooltip of every row shows the complete reasoning (what was measured, what was estimated, which alternatives were discarded and why), a decision log runs below, and everything is persisted to `strategy-log.jsonl`. The engine **measures the session as it happens** (real pit loss, SC/VSC discount factors, fresh-tyre gain) and starts every race pre-loaded with **circuit priors mined from every 2022-2026 race**: pit loss, SC/VSC factors, undercut gain and **tyre life per compound** (median/P90 stint lengths actually achieved at that track). Decisions are backtest-calibrated on 39k logged verdicts: undercut threats quote their **measured risk** (21% inside 1 s, 10% inside 2 s), a **pit-lap scanner** paints now..+5 laps green/yellow/red by projected rejoin traffic, verdicts are debounced against flip-flopping, and every suggested stop passes a **tyre-plan check** — if no fresh set reaches the flag but waiting a few laps makes it a one-stopper, the stop is deferred (pitting into a forced extra late stop is never free). Track-position awareness includes lapped cars, SC queue packing, and the rule that an undercutter who rejoined into traffic must NOT be covered. |
 | **Analysis** | Launcher of the analysis toolbox — each tool in its own window, all sharing driver/lap-range/multi-zone selectors (every corner and straight of the track, auto-detected and labelled T1…Tn), a **Per lap / Total** mode, data tables under the charts, optional **trend lines** (linear/quadratic/exponential) and hover synchronization with every map and chart. **Energy**: *Deploy & Coast* (battery derate zones and lift & coast painted on the track with meters ×passes, per-lap meters) and *Battery balance* (estimated battery index, charge/discharge per lap, management comparison). **Dynamics**: *Friction circle* (g-g cloud + per-driver envelope), *G forces* (lateral/longitudinal along the lap + intensity map), *Acceleration* (speed vs traction G) and *Grip degradation* (peak lateral G and Vmin per corner across laps — measured tyre drop-off). |
 | **Race control** | Chronological log of official messages. |
 | **Weather** | Current air/track temperature, wind (speed and direction), humidity, pressure and rain. |
@@ -456,10 +457,21 @@ python -m venv .venv
 .\build.ps1
 ```
 
-Produces `dist\BoxBox-F1\` with **two executables** —
-`BoxBox-F1.exe` (visualizer) and `capture\BoxBox-F1-Capture.exe`
-(capturer, its own `_internal`) — plus `dist\BoxBox-F1-win64.zip`,
-ready to upload as the GitHub release asset. No Python required.
+Produces `dist\BoxBox-F1\` with **three executables** —
+`BoxBox-F1.exe` (visualizer), `capture\BoxBox-F1-Capture.exe`
+(capturer, its own `_internal`) and `BoxBox-F1-Harvest.exe` (console
+tool) — plus `dist\BoxBox-F1-win64.zip`, ready to upload as the GitHub
+release asset. No Python required.
+
+`BoxBox-F1-Harvest.exe` batch-replays historical Fast-F1 races at full
+speed through the same strategy engine as the app and writes one
+decision log **with measured outcomes** per race — the input used to
+calibrate the Strategy board (risk curves, circuit priors, tyre life):
+
+```powershell
+.\BoxBox-F1-Harvest.exe 2024:Bahrain:R "2025:Monza"
+.\BoxBox-F1-Harvest.exe --list carreras.txt   # all 2022-2026 races
+```
 
 If **Inno Setup 6** is installed (`winget install JRSoftware.InnoSetup`),
 the build also produces `dist\BoxBox-F1-setup.exe`: a proper installer
