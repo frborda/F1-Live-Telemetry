@@ -248,7 +248,9 @@ def main(argv=None) -> int:
 
     specs = list(args.specs)
     if args.list_file:
-        for line in Path(args.list_file).read_text("utf-8").splitlines():
+        # utf-8-sig: PowerShell 5.1 escribe BOM con -Encoding utf8 y el
+        # primer spec del archivo quedaba invalido
+        for line in Path(args.list_file).read_text("utf-8-sig").splitlines():
             line = line.split("#", 1)[0].strip()
             if line:
                 specs.append(line)
