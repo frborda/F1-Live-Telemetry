@@ -895,7 +895,8 @@ def test_strategy_board() -> None:
     # separaciones en pista (50 m/s → 1 s = 50 m): "2" a 3 s del líder
     # (amenaza), "3" a 31 s (parada gratis para "2"), "4" a 1.5 s de "3"
     # (atrapado — pasar es difícil)
-    offsets = {"1": 0.0, "2": 150.0, "3": 1550.0, "4": 1620.0}
+    # "2" a 1.5 s: el gate medido exige <2 s para WATCH activo
+    offsets = {"1": 0.0, "2": 75.0, "3": 1550.0, "4": 1620.0}
     hub_s.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
                     "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
     eng = StrategyEngine(hub_s, _TA(hub_s))
@@ -920,8 +921,10 @@ def test_strategy_board() -> None:
 
     # pista verde: amenaza, parada gratis y búsqueda de aire
     check(adv["1"].action == "WATCH"
-          and "undercut" in adv["1"].trace[-1],
-          f"estrategia: líder amenazado → WATCH ({adv['1'].action})")
+          and any("undercut" in t and "risk" in t
+                  for t in adv["1"].threats),
+          f"estrategia: líder amenazado → WATCH con riesgo medido "
+          f"({adv['1'].action})")
     check(adv["2"].action == "FREE STOP"
           and "exceeds window" in adv["2"].trace[-1],
           f"estrategia: hueco atrás → FREE STOP ({adv['2'].action})")
@@ -1067,6 +1070,40 @@ def test_strategy_board() -> None:
           and "measured" in tr_m,
           f"estrategia: SC con factor MEDIDO en la traza "
           f"({adv_m['1'].action})")
+
+    # ---- priors por circuito: Spa hereda su historia medida; el
+    # Spanish GP de Madrid (otro trazado) NO hereda la de Barcelona
+    from f1telem.strategy_priors import PRIORS as _PRIORS
+
+    def mini_race(meeting, track_len):
+        h = _DH()
+        h.on_track_length(track_len)
+        h.on_session_meta({"type": "Race", "name": "Race",
+                           "meeting": meeting, "year": 2099})
+        h.on_tyres({"1": {1: ("HARD", 9)}, "2": {1: ("HARD", 9)}})
+        batch = []
+        for drv, off in (("1", 0.0), ("2", 100.0)):
+            for k in range(60):
+                t = k * 2.0
+                d = 50.0 * t - off
+                if d < 0:
+                    continue
+                batch.append(_S(drv, t, int(d // track_len) + 1,
+                                d % track_len, d, 180.0, 90.0, 0.0,
+                                0.0, 6, 0))
+        h.on_batch(batch)
+        return StrategyEngine(h, _TA(h)).evaluate()["1"]
+
+    adv_pr = mini_race("Belgian Grand Prix", 6940.0)
+    exp_w = _PRIORS["Belgian Grand Prix"]["pit_loss"][0]
+    check("circuit prior" in adv_pr.factors["window_src"]
+          and abs(adv_pr.factors["window"] - exp_w) < 0.01,
+          f"estrategia: prior de circuito aplicado en Spa "
+          f"({adv_pr.factors['window']:.1f}s)")
+    adv_md = mini_race("Spanish Grand Prix", 5470.0)
+    check(adv_md.factors["window_src"] == "configured",
+          f"estrategia: prior rechazado si el trazado no coincide "
+          f"({adv_md.factors['window_src']})")
 
     # ---- fase 3: cliff de goma, ventana de ataque y proyección a bandera
     hub_c = _DH()

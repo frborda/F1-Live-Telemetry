@@ -80,8 +80,19 @@ STUCK_LAPS = 3           # vueltas seguidas pegado para declararlo atrapado
 FRESH_ABSORB = 5         # vueltas de ventaja de goma para absorber undercut
 STINT_LIFE_DROP = 1.2    # s/vuelta perdidos que marcan el fin útil del stint
 PACK_SPACING = 1.2       # s/auto en la fila india detrás del SC
-CLIFF_CURV = 0.015       # s/vuelta²: aceleración de deg que declara cliff
-CLIFF_MARGINAL = 0.35    # s/vuelta perdidos AHORA para declarar cliff
+# cliff RETUNEADO con el backtest de 102 carreras: los umbrales viejos
+# (0.015/0.35) declaraban cliff en el 10% de las decisiones y el 92% de
+# los que siguieron en pista NO perdió posición — falsos positivos. Se
+# exige el doble de curvatura, casi el doble de pérdida marginal y goma
+# con edad de cliff plausible (≥8 vueltas).
+CLIFF_CURV = 0.03        # s/vuelta²: aceleración de deg que declara cliff
+CLIFF_MARGINAL = 0.6     # s/vuelta perdidos AHORA para declarar cliff
+CLIFF_AGE_MIN = 8        # goma más joven no cliffea: es ruido del ajuste
+# curva MEDIDA (backtest 39k decisiones): P(perder posición en 3
+# vueltas, sin parar) según el gap con el de atrás
+THREAT_RISK = ((1.0, 21.5), (2.0, 7.7), (3.0, 4.8), (4.0, 3.1))
+THREAT_ACTION_GAP = 2.0  # solo <2 s (riesgo ≥8%) amerita WATCH activo;
+#                          entre 2 y u_range la amenaza se lista como info
 FLAG_NET_MIN = 5.0       # s netos mínimos para el last-call a bandera
 LAST_CALL_LAPS = 10      # vueltas finales donde aplica el last-call
 COVER_WINDOW_S = 90.0    # s tras la parada rival en que se puede responder
@@ -170,10 +181,36 @@ class SessionMeasures:
         self.sc: tuple[float, int] | None = None
         self.vsc: tuple[float, int] | None = None
         self.gain: tuple[float, int] | None = None
+        self.prior: dict | None = None   # mediana histórica del circuito
+        self._prior_key = None
 
     def reset(self) -> None:
         self._seen = (-1, -1)
         self.window = self.sc = self.vsc = self.gain = None
+        self.prior = None
+        self._prior_key = None
+
+    def load_prior(self) -> None:
+        """Prior del circuito: medianas históricas 2022-2026 (generadas
+        por el backtest del harvester). Solo por nombre de meeting Y con
+        el largo de pista coincidiendo — el Spanish GP de Madrid no debe
+        heredar los números de Barcelona."""
+        meeting = str(self.hub.session_meta.get("meeting", "")).strip()
+        L = float(self.hub.track_length)
+        key = (meeting, round(L))
+        if key == self._prior_key:
+            return
+        self._prior_key = key
+        self.prior = None
+        if not meeting:
+            return
+        try:
+            from .strategy_priors import PRIORS
+        except ImportError:
+            return
+        row = PRIORS.get(meeting)
+        if row is not None and abs(float(row["track_length"]) - L) <= 300.0:
+            self.prior = row
 
     def update(self) -> None:
         """Recalcula solo si hay una parada cerrada nueva O avanzó la
@@ -214,6 +251,20 @@ class SessionMeasures:
         if self.gain:
             parts.append(f"fresh-tyre gain {self.gain[0]:.1f}s "
                          f"({self.gain[1]} stops)")
+        if self.prior:
+            p = self.prior
+            bits = []
+            if "pit_loss" in p:
+                bits.append(f"box {p['pit_loss'][0]:.1f}s")
+            if "sc" in p and p["sc"][1] >= 2:
+                bits.append(f"SC ×{p['sc'][0]:.2f}")
+            if "vsc" in p and p["vsc"][1] >= 2:
+                bits.append(f"VSC ×{p['vsc'][0]:.2f}")
+            if "gain" in p and p["gain"][1] >= 2:
+                bits.append(f"gain {p['gain'][0]:.1f}s")
+            if bits:
+                parts.append(f"circuit prior[{p.get('races', '?')}r]: "
+                             + " ".join(bits))
         return (" · ".join(parts) if parts else
                 "no measurable stops yet — phase-1 estimates in use")
 
@@ -453,7 +504,8 @@ class StrategyEngine:
             out["curv"] = float(a)
             out["marginal"] = float(2.0 * a * xs[-1] + b)
             if out["curv"] > CLIFF_CURV \
-                    and out["marginal"] >= CLIFF_MARGINAL:
+                    and out["marginal"] >= CLIFF_MARGINAL \
+                    and out["age"] >= CLIFF_AGE_MIN:
                 out["cliff"] = True
         return out
 
@@ -714,7 +766,10 @@ class StrategyEngine:
             if g_own_pre is None:
                 continue
             delta_pre = g_pre - g_own_pre  # + = el rival venía detrás
-            if abs(delta_pre) <= u_range + 2.0:
+            # umbral SIN margen extra: el backtest midió riesgo ~2% (=
+            # ruido de base) más allá de u_range, y cubrir de más pierde
+            # incluso a bandera (ΔFIN +2.2 cubriendo vs +0.4 aguantando)
+            if abs(delta_pre) <= u_range:
                 key = (0 if delta_pre > 0 else 1, abs(delta_pre))
                 if best is None or key < best[0]:
                     best = (key, (rival, now - t_in, abs(delta_pre),
@@ -742,26 +797,44 @@ class StrategyEngine:
         neutral = neutralization(hub)
         self.measures.update()
         meas = self.measures
+        meas.load_prior()
+        prior = meas.prior or {}
+        # precedencia: medido EN VIVO > prior del circuito > estimación
         if meas.window is not None and meas.window[1] >= 2:
             window = float(meas.window[0])
             w_src = f"measured from {meas.window[1]} stops"
+        elif "pit_loss" in prior:
+            window = float(prior["pit_loss"][0])
+            w_src = f"circuit prior ({prior['pit_loss'][1]} races)"
         else:
             window = float(self.pit_window)
             w_src = "configured"
+        p_sc = prior.get("sc")
+        p_vsc = prior.get("vsc")
         if neutral == "SC":
-            cheap, f_src = ((float(meas.sc[0]), f"measured ({meas.sc[1]})")
-                            if meas.sc else (SC_FACTOR, "phase-1 estimate"))
+            cheap, f_src = (
+                (float(meas.sc[0]), f"measured ({meas.sc[1]})")
+                if meas.sc else
+                (float(p_sc[0]), f"circuit prior ({p_sc[1]}r)")
+                if p_sc and p_sc[1] >= 2 else
+                (SC_FACTOR, "global median, 145 stops"))
         elif neutral == "VSC":
-            cheap, f_src = ((float(meas.vsc[0]),
-                             f"measured ({meas.vsc[1]})")
-                            if meas.vsc else (VSC_FACTOR,
-                                              "phase-1 estimate"))
+            cheap, f_src = (
+                (float(meas.vsc[0]), f"measured ({meas.vsc[1]})")
+                if meas.vsc else
+                (float(p_vsc[0]), f"circuit prior ({p_vsc[1]}r)")
+                if p_vsc and p_vsc[1] >= 2 else
+                (VSC_FACTOR, "global median, 69 stops"))
         else:
             cheap, f_src = 1.0, ""
         window_now = window * cheap
+        p_gain = prior.get("gain")
         if meas.gain is not None and meas.gain[1] >= 2:
             u_range = float(meas.gain[0])
             u_src = f"measured from {meas.gain[1]} stops"
+        elif p_gain and p_gain[1] >= 2:
+            u_range = float(p_gain[0])
+            u_src = f"circuit prior ({p_gain[1]} races)"
         else:
             u_range, u_src = UNDERCUT_RANGE, "phase-1 estimate"
         self._lap_s = self._leader_lap_s(ordered[0])
@@ -887,14 +960,17 @@ class StrategyEngine:
                 # la pagan; el undercut salta solo si el gap es menor a la
                 # ganancia acumulada de goma fresca
                 if gap_behind < u_range:
+                    risk = next((r for lim, r in THREAT_RISK
+                                 if gap_behind < lim), THREAT_RISK[-1][1])
                     threats.append(
                         f"{nxt} undercut range ({gap_behind:.1f}s < "
-                        f"{u_range:.1f}s)")
+                        f"{u_range:.1f}s, risk ~{risk:.0f}%)")
                     trace.append(
                         f"threat: {nxt} at {gap_behind:.1f}s can undercut "
                         f"(fresh-tyre gain ~{u_range:.1f}s over 2-3 laps "
-                        f"[{u_src}]; the window cancels out — both cars "
-                        "pay it)")
+                        f"[{u_src}]); measured risk of losing the spot "
+                        f"within 3 laps: ~{risk:.0f}% (backtest "
+                        "2022-2026, 39k decisions)")
             if i > 0 and gaps.get(drv) is not None:
                 prev = next((d for d in reversed(ordered[:i])
                              if gaps.get(d) is not None), None)
@@ -1163,12 +1239,21 @@ class StrategyEngine:
                     f"pitting (+{flag_delta:.1f}s net) and only "
                     f"{laps_left} laps remain: every lap waited erodes "
                     "the net; rejoin is clear" + scan_txt)
-            elif threats:
+            elif threats and ((gap_behind is not None
+                               and gap_behind < THREAT_ACTION_GAP)
+                              or any("attack window" in t
+                                     for t in threats)):
                 action, reason = "WATCH", threats[0]
                 urgency = 1
                 trace.append(
-                    "decision: WATCH — undercut threat active; no better "
-                    "move yet" + scan_txt)
+                    "decision: WATCH — threat active and measured risk "
+                    "meaningful (≥8% under 2s); no better move yet"
+                    + scan_txt)
+            elif threats:
+                trace.append(
+                    "decision: STAY — threat listed but measured risk "
+                    f"at {gap_behind:.1f}s is near baseline (<5%): no "
+                    "reaction warranted (backtest-gated)" + scan_txt)
             else:
                 trace.append(
                     "decision: STAY — no neutralization, no rival stop to "
