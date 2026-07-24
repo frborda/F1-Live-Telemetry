@@ -31,6 +31,7 @@ _ACTION_COLORS = {
     "BOX NOW": "#e10600",
     "COVER": "#ff8c00",
     "FREE STOP": "#2fbf71",
+    "UNDERCUT": "#b57bee",
     "BOX FOR AIR": "#37d0ee",
     "BOX SOON": "#d6be3c",
     "WATCH": "#d6be3c",
@@ -149,7 +150,7 @@ class StrategyBoardView(QWidget):
                 if c == 3:
                     color = _ACTION_COLORS.get(
                         adv.action.split()[0] if adv.action.startswith(
-                            "COVER") else adv.action, "")
+                            ("COVER", "UNDERCUT")) else adv.action, "")
                     if color:
                         item.setForeground(QColor(color))
                     font = item.font()

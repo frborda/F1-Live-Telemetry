@@ -898,7 +898,7 @@ def test_strategy_board() -> None:
     # "2" a 1.5 s: el gate medido exige <2 s para WATCH activo
     offsets = {"1": 0.0, "2": 75.0, "3": 1550.0, "4": 1620.0}
     hub_s.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
-                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+                    "3": {1: ("MEDIUM", 1)}, "4": {1: ("MEDIUM", 6)}})
     eng = StrategyEngine(hub_s, _TA(hub_s))
     eng.pit_window = 20.0
 
@@ -963,7 +963,7 @@ def test_strategy_board() -> None:
     # goma fresca ABSORBE el undercut: sin respuesta necesaria
     cur_l = hub_s.buffers["1"].current_lap()
     hub_s.on_tyres({"1": {cur_l: ("SOFT", 0)}, "2": {1: ("HARD", 8)},
-                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+                    "3": {1: ("MEDIUM", 1)}, "4": {1: ("MEDIUM", 6)}})
     # histéresis: STAY (urgencia 0) no reemplaza a COVER hasta
     # sostenerse DEBOUNCE_S — se expira el reloj y se re-evalúa
     adv = eng.evaluate()
@@ -987,7 +987,7 @@ def test_strategy_board() -> None:
     # gap del doblado dice "+1 vuelta" pero en pista está justo donde cae
     # el rejoin — cubrir cambia la pérdida del undercut por una trampa
     hub_s.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
-                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+                    "3": {1: ("MEDIUM", 1)}, "4": {1: ("MEDIUM", 6)}})
     hub_s.on_batch([_S("5", 230.0 + k * 2.0, 3, 1550.0 + k * 100.0,
                        7550.0 + k * 100.0, 180.0, 90.0, 0.0, 0.0, 6, 0)
                     for k in range(5)])
@@ -1006,6 +1006,31 @@ def test_strategy_board() -> None:
           and scan2["best"] == 5,
           f"estrategia: el escáner arrastra al doblado con su deriva "
           f"({[e['rating'] for e in scan2['ratings']]})")
+    # el undercutter cayó EN LA TRAMPA (salió de boxes al tráfico): no
+    # cubrirse — su goma fresca se quema en el tren
+    hub_s.pit_lane = {"2": [[5, hub_s.latest_t - 10.0,
+                             hub_s.latest_t - 6.0]]}
+    eng.evaluate()
+    eng._candidate["1"] = ("STAY", hub_s.latest_t - 11.0)
+    adv = eng.evaluate()
+    check(adv["1"].action == "STAY"
+          and adv["1"].factors["cover"].get("rival_trapped") is True
+          and "same trap" in " ".join(adv["1"].trace),
+          f"estrategia: undercutter atrapado → no cubrirse "
+          f"({adv['1'].action})")
+    # veredicto de ATAQUE minado del comportamiento real: pegado al de
+    # adelante con goma vieja y rejoin limpio → UNDERCUT
+    hub_s.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
+                    "3": {1: ("MEDIUM", 9)}, "4": {1: ("MEDIUM", 6)}})
+    hub_s.pit_lane = {}
+    eng.evaluate()
+    eng._candidate["4"] = ("UNDERCUT 3", hub_s.latest_t - 11.0)
+    adv = eng.evaluate()
+    check(adv["4"].action == "UNDERCUT 3"
+          and "attack" in adv["4"].reason
+          and "21%" in " ".join(adv["4"].trace),
+          f"estrategia: ventana de ataque → UNDERCUT "
+          f"({adv['4'].action})")
     # fuera de carrera el motor no opina
     hub_s.on_session_meta({"type": "Practice", "name": "Practice 1"})
     check(eng.evaluate() == {}, "estrategia: solo opina en carrera")
@@ -1172,7 +1197,7 @@ def test_strategy_board() -> None:
     hub_r.on_session_meta({"type": "Race", "name": "Race",
                            "meeting": "Harvest GP", "year": 2099})
     hub_r.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
-                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+                    "3": {1: ("MEDIUM", 1)}, "4": {1: ("MEDIUM", 6)}})
     eng_r = StrategyEngine(hub_r, _TA(hub_r))
     rec_r = DecisionRecorder(hub_r, eng_r)
     offsets_r = {"1": 0.0, "2": 150.0, "3": 1550.0, "4": 1620.0}

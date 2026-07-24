@@ -12,9 +12,12 @@ Principios (pedidos explícitos):
 - Un rival directo que boxea abre una cuenta regresiva de respuesta.
 
 Acciones (por prioridad): IN PIT · BOX NOW (SC/VSC barata) · COVER
-(responder parada rival) · FREE STOP (parada gratis) · BOX FOR AIR
-(atrapado en tráfico, rejoin limpio) · BOX SOON (goma al límite) ·
-WATCH (amenaza de undercut) · STAY.
+(responder parada rival) · FREE STOP (parada gratis) · UNDERCUT
+(atacar por boxes al de adelante, curva de éxito medida) · BOX FOR
+AIR (atrapado en tráfico, rejoin limpio) · BOX SOON (goma al límite) ·
+WATCH (amenaza de undercut) · STAY. Regla de comportamiento real: si
+el rival que undercuteó cayó en tráfico, NO cubrirse — su goma fresca
+se quema en el tren y cubrir regalaría nuestro aire limpio.
 
 Fase 2 — medir lo que la fase 1 estimaba, y decidir con eso:
 - SessionMeasures: pérdida REAL de una parada (verde), factor de
@@ -600,6 +603,37 @@ class StrategyEngine:
                 if rbuf.current_lap() < lap_own:
                     lapped.add(r)
 
+    def _track_gap_ahead(self, drv: str) -> tuple[str, float] | None:
+        """(auto, s) más cercano físicamente DELANTE en pista (doblados
+        incluidos, boxes excluidos). Dice si un auto está en tráfico
+        real — p.ej. el rival que undercuteó y cayó en un tren."""
+        hub = self.hub
+        L = hub.track_length
+        v = L / self._lap_s if self._lap_s > 0 else 0.0
+        buf = hub.buffers.get(drv)
+        if v <= 0 or buf is None or not buf.n:
+            return None
+        now = hub.latest_t
+
+        def s_at(b) -> float:
+            return (float(b.col("dist_lap")[-1])
+                    + (now - float(b.col("t")[-1])) * v)
+
+        s_own = s_at(buf)
+        best = None
+        for r, rbuf in hub.buffers.items():
+            if r == drv or not rbuf.n:
+                continue
+            if now - float(rbuf.col("t")[-1]) > 20.0:
+                continue
+            visit = hub.last_pit_visit(r)
+            if visit is not None and hub.pit_visit_open(visit):
+                continue
+            x = ((s_at(rbuf) - s_own) % L) / v
+            if best is None or x < best[1]:
+                best = (r, x)
+        return best
+
     def _leader_lap_s(self, leader: str) -> float:
         buf = self.hub.buffers.get(leader)
         if buf is None or not buf.n:
@@ -978,12 +1012,17 @@ class StrategyEngine:
                         f"[{u_src}]); measured risk of losing the spot "
                         f"within 3 laps: ~{risk:.0f}% (backtest "
                         "2022-2026, 39k decisions)")
-            if i > 0 and gaps.get(drv) is not None:
-                prev = next((d for d in reversed(ordered[:i])
-                             if gaps.get(d) is not None), None)
-                p_st = stints.get(prev, {}) if prev is not None else {}
-                if p_st.get("cliff") \
-                        and (gaps[drv] - gaps[prev]) <= 5.0:
+            # rival posicional DELANTE (en vuelta): alimenta la ventana
+            # de ataque por cliff y el veredicto UNDERCUT
+            prev = (next((d for d in reversed(ordered[:i])
+                          if gaps.get(d) is not None), None)
+                    if i > 0 else None)
+            gap_ahead = (gaps[drv] - gaps[prev]
+                         if prev is not None
+                         and gaps.get(drv) is not None else None)
+            if prev is not None and gap_ahead is not None:
+                p_st = stints.get(prev, {})
+                if p_st.get("cliff") and gap_ahead <= 5.0:
                     threats.append(
                         f"{prev} ahead on the tyre cliff "
                         f"(+{p_st['marginal']:.1f}s/lap) — attack window")
@@ -1085,6 +1124,19 @@ class StrategyEngine:
                         f"asymmetry: {r_code}'s stop was cheap (under "
                         f"{r_neutral}) but responding now pays the FULL "
                         "window — covering only stops further bleeding")
+                # ¿el undercutter cayó en una trampa? Si ya salió de
+                # boxes y quedó a <TRAFFIC_CLOSE de otro auto, su goma
+                # fresca se quema en el tren: cubrir sería entregar
+                # nuestro aire limpio para caer en la misma trampa
+                r_visit = hub.last_pit_visit(rival)
+                r_ahead = (self._track_gap_ahead(rival)
+                           if r_visit is not None
+                           and not hub.pit_visit_open(r_visit) else None)
+                if r_ahead is not None:
+                    factors["cover"]["rival_gap_ahead"] = \
+                        round(r_ahead[1], 2)
+                    factors["cover"]["rival_trapped"] = \
+                        r_ahead[1] < TRAFFIC_CLOSE
                 if endgame:
                     action, reason = "STAY", (
                         f"{r_code}'s stop can't pay back — "
@@ -1116,6 +1168,17 @@ class StrategyEngine:
                         f"{stint['age']} laps old (≤{FRESH_ABSORB}): "
                         "their fresh-tyre gain can't overcome ours — "
                         "the undercut is absorbed, no response needed")
+                elif r_ahead is not None and r_ahead[1] < TRAFFIC_CLOSE:
+                    t_info = self.hub.drivers.get(r_ahead[0])
+                    t_code = t_info.code if t_info else r_ahead[0]
+                    action, reason = "STAY", (
+                        f"{r_code}'s undercut hit traffic — hold")
+                    trace.append(
+                        f"decision: STAY — {r_code} pitted to undercut "
+                        f"BUT rejoined only {r_ahead[1]:.1f}s behind "
+                        f"{t_code}: their fresh-tyre gain is burning in "
+                        "the train — covering would trade our clean air "
+                        "for the same trap" + scan_txt)
                 elif traffic is not None and not traffic["clear"] \
                         and traffic["ahead_close"][0][0] != rival:
                     trap, tgap = traffic["ahead_close"][0]
@@ -1183,6 +1246,35 @@ class StrategyEngine:
                         f"margin, tyres have {stint['age']} laps and the "
                         "rejoin is CLEAR (track-position check incl. "
                         "lapped cars): pitting is free")
+            elif gap_ahead is not None \
+                    and gap_ahead < THREAT_ACTION_GAP \
+                    and stuck >= 2 and traffic is not None \
+                    and traffic["clear"] and proj is not None \
+                    and (proj[0] - (i + 1)) <= AIR_MAX_LOSS \
+                    and stint["age"] >= 6 \
+                    and stints.get(prev, {}).get("age", 0) \
+                    >= FRESH_AGE_MIN and not endgame:
+                # veredicto de ATAQUE (minado del comportamiento real):
+                # el motor solo defendía, pero la curva medida vale
+                # igual desde el atacante — a <1 s el de adelante pierde
+                # la posición el 21% de las veces, a <2 s el 10%
+                p_info = self.hub.drivers.get(prev)
+                p_code = p_info.code if p_info else prev
+                p_age = stints.get(prev, {}).get("age", 0)
+                action = f"UNDERCUT {p_code}"
+                reason = f"attack {p_code} via the pit lane — window open"
+                urgency = 1
+                factors["undercut_target"] = {
+                    "rival": prev, "gap": round(gap_ahead, 2),
+                    "target_age": p_age}
+                trace.append(
+                    f"decision: UNDERCUT — stuck {stuck} laps at "
+                    f"{gap_ahead:.1f}s behind {p_code} (their tyres "
+                    f"{p_age} laps old, ours {stint['age']}): pit first "
+                    "and attack — measured on 39k decisions: the car "
+                    "ahead loses the spot ~21% within 1s and ~10% "
+                    "within 2s over 3 laps; rejoin is CLEAR at "
+                    f"P{proj[0]}" + scan_txt)
             elif stuck >= STUCK_LAPS and traffic is not None \
                     and traffic["clear"] and proj is not None \
                     and (proj[0] - (i + 1)) <= AIR_MAX_LOSS \
