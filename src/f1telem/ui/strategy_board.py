@@ -51,6 +51,9 @@ class StrategyBoardView(QWidget):
         self.cfg = cfg if cfg is not None else {}
         self.analyzer = TimingAnalyzer(hub)
         self.engine = StrategyEngine(hub, self.analyzer)
+        # main_window lo apunta al spin de la Ventana de Box del panel
+        # Pit strategy: una sola fuente de verdad para la pérdida de box
+        self.window_source = None
         self._last_eval = 0.0
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 2, 4, 4)
@@ -101,8 +104,12 @@ class StrategyBoardView(QWidget):
             return
         self._last_eval = now
         # la Ventana de Box vigente la gobierna el panel Pit strategy
-        self.engine.pit_window = float(
-            self.cfg.get("strategy", {}).get("pit_window", 20.0))
+        # (en vivo si está cableado; si no, su último valor persistido)
+        if self.window_source is not None:
+            self.engine.pit_window = float(self.window_source())
+        else:
+            self.engine.pit_window = float(
+                self.cfg.get("strategy", {}).get("pit_window", 20.0))
         advices = self.engine.evaluate()
         self.measures_lbl.setText(
             "Measured: " + self.engine.measures.summary())

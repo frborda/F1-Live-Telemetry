@@ -367,6 +367,10 @@ class MainWindow(QMainWindow):
         self.pitlane_map_view = PitlaneMapView(self.hub, self.cfg)
         self.pit_strategy_view = PitStrategyView(self.hub, self.cfg)
         self.strategy_board_view = StrategyBoardView(self.hub, self.cfg)
+        # el motor de estrategia usa la MISMA Ventana de Box que muestra
+        # Pit strategy (auto-medida allí, o trabada por el usuario)
+        self.strategy_board_view.window_source = \
+            self.pit_strategy_view.window_spin.value
         self.notifier = NotificationCenter(self.hub, self.cfg, self)
         self.notifications_view = NotificationsPanel(self.notifier, self.cfg)
         self.weather_now = WeatherNowPanel(self.hub)

@@ -420,6 +420,29 @@ class PitStrategyView(QWidget):
             self.window_spin.blockSignals(False)
             self.cfg.setdefault("strategy", {})["pit_window"] = round(value, 1)
 
+    def _apply_prior_seed(self) -> None:
+        """Sin paradas medibles todavía: sembrar la Ventana de Box con
+        el prior del circuito (mediana histórica 2022-2026) en lugar
+        del default — en Singapur la parada cuesta 30 s, no 20. La
+        traba del usuario y la primera medición real la pisan."""
+        from ..strategy_engine import circuit_prior
+
+        row = circuit_prior(self.hub)
+        if row is None or "pit_loss" not in row:
+            return
+        val = float(row["pit_loss"][0])
+        self.auto_label.setText(
+            f"auto: {val:.1f}s (circuit prior, "
+            f"{row['pit_loss'][1]} races)")
+        if self.lock_check.isChecked():
+            return
+        if abs(self.window_spin.value() - val) >= 0.05:
+            self.window_spin.blockSignals(True)
+            self.window_spin.setValue(round(val, 1))
+            self.window_spin.blockSignals(False)
+            self.cfg.setdefault("strategy", {})["pit_window"] = \
+                round(val, 1)
+
     # ------------------------------------------------------------ refresco
 
     def clear_data(self) -> None:
@@ -438,6 +461,8 @@ class PitStrategyView(QWidget):
             est = self.estimator.estimate()
             if est is not None:
                 self.apply_auto(*est)
+            else:
+                self._apply_prior_seed()
         if now - self._last_table < 1.0:
             return
         self._last_table = now

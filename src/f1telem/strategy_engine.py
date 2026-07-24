@@ -146,6 +146,24 @@ def _json_safe(obj):
     return obj
 
 
+def circuit_prior(hub) -> dict | None:
+    """Prior del circuito (medianas históricas 2022-2026 del backtest):
+    match por nombre de meeting CON guard de largo de pista — el
+    Spanish GP de Madrid no debe heredar los números de Barcelona."""
+    meeting = str(hub.session_meta.get("meeting", "")).strip()
+    if not meeting:
+        return None
+    try:
+        from .strategy_priors import PRIORS
+    except ImportError:
+        return None
+    row = PRIORS.get(meeting)
+    if row is not None and abs(float(row["track_length"])
+                               - float(hub.track_length)) <= 300.0:
+        return row
+    return None
+
+
 def neutral_between(hub, t0: float, t1: float) -> str | None:
     """Neutralización que pisa [t0, t1] (SC gana sobre VSC)."""
     found = None
@@ -194,26 +212,13 @@ class SessionMeasures:
         self._prior_key = None
 
     def load_prior(self) -> None:
-        """Prior del circuito: medianas históricas 2022-2026 (generadas
-        por el backtest del harvester). Solo por nombre de meeting Y con
-        el largo de pista coincidiendo — el Spanish GP de Madrid no debe
-        heredar los números de Barcelona."""
+        """Cachea el prior del circuito (ver circuit_prior)."""
         meeting = str(self.hub.session_meta.get("meeting", "")).strip()
-        L = float(self.hub.track_length)
-        key = (meeting, round(L))
+        key = (meeting, round(float(self.hub.track_length)))
         if key == self._prior_key:
             return
         self._prior_key = key
-        self.prior = None
-        if not meeting:
-            return
-        try:
-            from .strategy_priors import PRIORS
-        except ImportError:
-            return
-        row = PRIORS.get(meeting)
-        if row is not None and abs(float(row["track_length"]) - L) <= 300.0:
-            self.prior = row
+        self.prior = circuit_prior(self.hub)
 
     def update(self) -> None:
         """Recalcula solo si hay una parada cerrada nueva O avanzó la
@@ -421,7 +426,8 @@ class StrategyEngine:
     def __init__(self, hub, analyzer):
         self.hub = hub
         self.analyzer = analyzer
-        self.pit_window = 20.0   # lo actualiza la UI desde cfg strategy
+        self.pit_window = 20.0   # la fija la UI: Ventana de Box del
+        #                          panel Pit strategy (fuente única)
         self.advices: dict[str, Advice] = {}
         self.log: deque = deque(maxlen=400)   # (t, lap, drv, action, reason)
         self._last_action: dict[str, str] = {}
@@ -802,16 +808,14 @@ class StrategyEngine:
         meas = self.measures
         meas.load_prior()
         prior = meas.prior or {}
-        # precedencia: medido EN VIVO > prior del circuito > estimación
-        if meas.window is not None and meas.window[1] >= 2:
-            window = float(meas.window[0])
-            w_src = f"measured from {meas.window[1]} stops"
-        elif "pit_loss" in prior:
-            window = float(prior["pit_loss"][0])
-            w_src = f"circuit prior ({prior['pit_loss'][1]} races)"
-        else:
-            window = float(self.pit_window)
-            w_src = "configured"
+        # la pérdida de parada es la Ventana de Box del panel Pit
+        # strategy — UNA fuente de verdad para toda la app (el panel ya
+        # se auto-mide con las paradas reales, arranca sembrado con el
+        # prior del circuito y respeta la traba del usuario). Para
+        # factores SC/VSC y ganancia de goma sigue la precedencia
+        # medido EN VIVO > prior del circuito > estimación global.
+        window = float(self.pit_window)
+        w_src = "Pit strategy window"
         p_sc = prior.get("sc")
         p_vsc = prior.get("vsc")
         if neutral == "SC":

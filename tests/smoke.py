@@ -1095,15 +1095,28 @@ def test_strategy_board() -> None:
         return StrategyEngine(h, _TA(h)).evaluate()["1"]
 
     adv_pr = mini_race("Belgian Grand Prix", 6940.0)
-    exp_w = _PRIORS["Belgian Grand Prix"]["pit_loss"][0]
-    check("circuit prior" in adv_pr.factors["window_src"]
-          and abs(adv_pr.factors["window"] - exp_w) < 0.01,
-          f"estrategia: prior de circuito aplicado en Spa "
-          f"({adv_pr.factors['window']:.1f}s)")
+    check(adv_pr.factors["window_src"] == "Pit strategy window"
+          and "circuit prior" in " ".join(adv_pr.trace),
+          "estrategia: prior del circuito en la traza (Spa) y ventana "
+          "del panel")
     adv_md = mini_race("Spanish Grand Prix", 5470.0)
-    check(adv_md.factors["window_src"] == "configured",
-          f"estrategia: prior rechazado si el trazado no coincide "
-          f"({adv_md.factors['window_src']})")
+    check("circuit prior" not in " ".join(adv_md.trace),
+          "estrategia: prior rechazado si el trazado no coincide")
+    # la Ventana de Box del panel Pit strategy (fuente única de la
+    # pérdida de parada) se siembra con el prior hasta la primera
+    # medición real
+    from f1telem.ui.pit_strategy import PitStrategyView as _PSV
+    hub_w = _DH()
+    hub_w.on_track_length(6940.0)
+    hub_w.on_session_meta({"type": "Race", "name": "Race",
+                           "meeting": "Belgian Grand Prix", "year": 2099})
+    psv = _PSV(hub_w, {})
+    psv.refresh()
+    exp_w = round(_PRIORS["Belgian Grand Prix"]["pit_loss"][0], 1)
+    check(abs(psv.window_spin.value() - exp_w) < 0.05
+          and "prior" in psv.auto_label.text(),
+          f"pit strategy: Ventana de Box sembrada por el prior "
+          f"({psv.window_spin.value():.1f}s)")
 
     # ---- fase 3: cliff de goma, ventana de ataque y proyección a bandera
     hub_c = _DH()
